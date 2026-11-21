@@ -1,0 +1,17 @@
+Olympus Mytikas 1.0.0 - the two addons are now one
+
+Install one folder. Inside it: OlympusRecruit 1.6.5 + KillOnSight 1.5.4 in one shell window with two tabs, one minimap button, their bundled map libraries and the Olympus art.
+
+WHAT'S IN THIS ONE ADDON
+- Files: OlympusMytikas.toc + OlympusMytikas.lua (the shared window, tabs and minimap button), OlympusRecruit.lua, KillOnSight.lua, Bootstrap.lua, libs\ (LibStub, CallbackHandler, HereBeDragons + pins), Media\ (portrait, minimap, panel, glow, bounty, emblem), CHANGELOG.txt.
+- Recruit tab: /om posts one random ad to /1 General and /2 Trade in one pass, 61 ads, custom ads (/om add, /om del), and the right-click "Invite to <guild>" line. Forever forbids addon invites, so it copies /ginvite First Surname for you to paste and press yourself. No auto-post.
+- Kill on Sight tab: shared kill board, death feed with last-known locations, 30-minute map pins, pending bounty jobs, flat 3g bounties verified against the guild bank, 70/30 split, monthly Hunter Board with one pooled prize, first-run rules notice, audit log, Valar/GM-only remove and settle.
+- Shared skin: one window on Forever's own chrome, titled Olympus Mytikas, with the white-mountain-on-navy portrait and matching minimap button (left opens the last tab, right posts an ad, drag saves the angle). KoS keeps its Board / Hunter Board sub-tabs; all /om and /kos commands still work.
+
+NEW IN THE MERGE
+- The Recruit tab's old custom art is gone; both tabs use the kill board's frame and bronze insets.
+- Latest upstream fixes are in: Recruit 1.6.5 dropped the 15 guild-war ads; KoS 1.5.4 fixed the "Valar" rank spelling that locked the rank out of its own board.
+
+STILL TRUE
+Gold never moves by addon: a person deposits at the bank and pays the hunter. A name on the board is not a bounty until the bank balance proves it.
+Delete the old OlympusRecruit and KillOnSight folders after installing. The source addons are left untouched for reference.
