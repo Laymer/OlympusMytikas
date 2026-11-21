@@ -1,4 +1,4 @@
-name: Shared addon window
+name: Addon behavior
 on: [push, pull_request]
 permissions:
   contents: read
@@ -9,4 +9,6 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - run: sudo apt-get update && sudo apt-get install -y lua5.1
+      - run: luac5.1 -p OlympusMytikas/*.lua OlympusMytikas/libs/*.lua
       - run: lua5.1 tests/shared-window.lua
+      - run: lua5.1 tests/gameplay.lua
