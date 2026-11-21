@@ -135,6 +135,21 @@ local function BuildShell()
 	tabRecruit = MakeTab("Recruit", 0, "recruit")
 	tabKos = MakeTab("Kill on Sight", 150, "kos")
 
+	local metadata = C_AddOns and C_AddOns.GetAddOnMetadata or GetAddOnMetadata
+	local version = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	version:SetPoint("LEFT", tabKos, "RIGHT", 8, 0)
+	version:SetText("v" .. (metadata(ADDON, "Version") or "?"))
+	local url = CreateFrame("EditBox", nil, bar, "InputBoxTemplate")
+	url:SetPoint("LEFT", version, "RIGHT", 10, 0)
+	url:SetPoint("RIGHT", bar, "RIGHT", -4, 0)
+	url:SetHeight(22)
+	url:SetAutoFocus(false)
+	local memberHome = "https://app.mytikas.monster/account.html"
+	url:SetText(memberHome)
+	url:SetScript("OnEditFocusGained", function(self) self:HighlightText() end)
+	url:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+	url:SetScript("OnEditFocusLost", function(self) self:SetText(memberHome) end)
+
 	content = CreateFrame("Frame", nil, f)
 	content:SetSize(CONTENT_W, CONTENT_H)
 	content:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -76)

@@ -1,3 +1,5 @@
+1.0.1 - Show installed version and a selectable Member Home URL in the shared window.
+
 Olympus Mytikas 1.0.0 - the two addons are now one
 
 Install one folder. Inside it: OlympusRecruit 1.6.5 + KillOnSight 1.5.4 in one shell window with two tabs, one minimap button, their bundled map libraries and the Olympus art.
