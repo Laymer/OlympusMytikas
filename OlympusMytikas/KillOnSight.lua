@@ -291,6 +291,7 @@ end
 -- Only the guild master and the Valar rank may remove rows or clear what the bank owes. Everybody
 -- else can still add a name, fund a bounty, announce it and read the board. These live on Board
 -- rather than as more top-level locals (Lua 5.1's main chunk is at its 200-local ceiling).
+Board.MAX_COPPER = 100000000
 Board.MANAGER_RANK = "Valar"
 Board.DENIED = "only the guild master or " .. Board.MANAGER_RANK ..
 	" can remove entries or clear what the bank owes"
@@ -370,8 +371,9 @@ local function Init()
 		db.killBonus = 0 -- left in old profiles only; never read again
 		local ask = tonumber(db.defaultReward) or DEFAULT_REWARD
 		for _, scope in pairs(db.scopes) do
-			for _, e in pairs(type(scope) == "table" and scope.entries or {}) do
-				if (tonumber(e.kills) or 0) > 1 and not e.paid and not e.refunded then
+			local entries = type(scope) == "table" and scope.entries
+			for _, e in pairs(type(entries) == "table" and entries or {}) do
+				if type(e) == "table" and (tonumber(e.kills) or 0) > 1 and not e.paid and not e.refunded then
 					e.want = math.max(ask, tonumber(e.funded) or 0)
 				end
 			end
@@ -587,8 +589,8 @@ local function ParseEntry(row)
 	local e = {
 		guid = guid,
 		stamp = stamp,
-		want = Num(f[4], 0, 100000000) or 0,
-		funded = Num(f[5], 0, 100000000) or 0,
+		want = Num(f[4], 0, Board.MAX_COPPER) or 0,
+		funded = Num(f[5], 0, Board.MAX_COPPER) or 0,
 		kills = Num(f[6], 0, 9999) or 0,
 		paid = f[7] == "1",
 		refunded = f[7] == "2",
@@ -964,7 +966,7 @@ function Board.ParseBoardRow(row)
 	if f[2] ~= "C" then return nil end
 	local who = Clean(f[3], MAX_NAME)
 	local target = Guid(f[4])
-	local amount = Num(f[6], 1, 100000000)
+	local amount = Num(f[6], 1, Board.MAX_COPPER)
 	if who == "" or not target or not amount then return nil end
 	return { kind = "C", who = who, target = target, tname = Clean(f[5], MAX_NAME),
 		amount = amount, at = at }
@@ -3505,7 +3507,8 @@ function ns.ShowAdd()
 		cancel:SetScript("OnClick", function() f:Hide() end)
 		ui.addBox = f
 	end
-	f.rewardBox:SetText(tostring(math.floor((tonumber(DB().defaultReward) or 0) / 10000)))
+	local gold = ("%.4f"):format((tonumber(DB().defaultReward) or 0) / 10000)
+	f.rewardBox:SetText((gold:gsub("0+$", ""):gsub("%.$", "")))
 	f.nameBox:SetText("")
 	f.reasonBox:SetText("")
 	f:Show()
@@ -3513,13 +3516,23 @@ function ns.ShowAdd()
 	return f
 end
 
+-- Use the same integer copper units that fit in a shared board entry.
+function Board.GoldToCopper(text)
+	local whole, fraction = text:match("^%s*(%d*)%.(%d*)%s*$")
+	if not whole then whole, fraction = text:match("^%s*(%d+)%s*$"), "" end
+	if not whole or (whole == "" and fraction == "") then return nil end
+	local amount = (tonumber(whole) or 0) * 10000 + tonumber((fraction .. "0000"):sub(1, 4))
+	if amount > Board.MAX_COPPER then return nil end
+	return amount
+end
+
 function ns.AddFromBox()
 	local f = ui.addBox
 	if not f then return end
 	local name = Clean(f.nameBox:GetText(), MAX_NAME)
 	if name == "" then Say("type the player's name first.") return end
-	local gold = tonumber((f.rewardBox:GetText() or ""):gsub("[^%d%.]", "")) or 3
-	local want = math.max(0, math.floor(gold * 10000))
+	local want = Board.GoldToCopper(f.rewardBox:GetText() or "")
+	if not want then Say("enter a gold amount from 0 to 10000.") return end
 	local reason = Clean(f.reasonBox:GetText() or "", MAX_REASON)
 	if reason == "" then reason = "added by " .. MyName() end
 	local guid = GuidForName(name)
@@ -3619,7 +3632,8 @@ end
 
 -- ============================================================================ commands
 
-local function Find(input)
+local function Find(input, useSelection)
+	if useSelection and not (input or ""):find("%S") then return ui.selected end
 	input = Clean(input or "", MAX_NAME)
 	if input == "" then return nil end
 	local s = Store()
@@ -3793,7 +3807,15 @@ local function Handler(msg)
 	if cmd == "add" then
 		local name, gold, reason = rest:match("^(%S+)%s*(%S*)%s*(.*)$")
 		if not name then Say("usage: /kos add <name> [gold] [reason]") return end
-		local want = tonumber(gold) and math.max(0, math.floor(tonumber(gold) * 10000)) or (tonumber(DB().defaultReward) or 0)
+		local want = tonumber(DB().defaultReward) or 0
+		if gold ~= "" then
+			if gold:match("^[%d.+-]") then
+				want = Board.GoldToCopper(gold)
+				if not want then Say("enter a gold amount from 0 to 10000.") return end
+			else
+				reason = gold .. " " .. reason
+			end
+		end
 		local text = Clean(reason, MAX_REASON)
 		local e
 		local guid = GuidForName(name)
@@ -3831,8 +3853,7 @@ local function Handler(msg)
 	end
 
 	if cmd == "bounty" or cmd == "job" then
-		local e = Find(rest)
-		if not e then e = ui.selected end
+		local e = Find(rest, true)
 		if not e then Say("nobody called %q is on the board.", Clean(rest, MAX_NAME)) return end
 		local ok, why = ns.StartBounty(e, true)
 		if not ok then Say("%s", tostring(why)) end
@@ -3840,10 +3861,7 @@ local function Handler(msg)
 	end
 
 	if cmd == "fund" then
-		local e = Find(rest)
-		if not e then
-			if ui.selected then e = ui.selected end
-		end
+		local e = Find(rest, true)
 		if not e then Say("nobody called %q is on the board.", Clean(rest, MAX_NAME)) return end
 		local ok, why = Fund(e)
 		if ok then
@@ -3921,8 +3939,7 @@ local function Handler(msg)
 		local trimmed = name:match("^(.-)%s+force%s*$")
 		if trimmed then force, name = true, trimmed end
 		if name:lower() == "force" then force, name = true, "" end
-		local e = Find(name)
-		if not e and ui.selected then e = ui.selected end
+		local e = Find(name, true)
 		if not e then Say("nobody called %q is on the board.", Clean(name, MAX_NAME)) return end
 		local ok, why = Remove(e.guid, force)
 		if not ok then
@@ -3936,8 +3953,7 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "announce" then
-		local e = Find(rest)
-		if not e then e = ui.selected end
+		local e = Find(rest, true)
 		if not e then Say("nothing to announce yet.") return end
 		Announce(e)
 		return
@@ -3959,9 +3975,9 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "reward" then
-		local gold = tonumber(rest)
-		if not gold or gold < 0 then Say("usage: /kos reward <gold>") return end
-		DB().defaultReward = math.floor(gold * 10000)
+		local amount = Board.GoldToCopper(rest)
+		if not amount then Say("usage: /kos reward <0-10000 gold>") return end
+		DB().defaultReward = amount
 		Say("a death now asks for %s - still deposit first.", Money(DB().defaultReward))
 		return
 	end
@@ -4065,7 +4081,7 @@ local function Handler(msg)
 	end
 	if cmd == "status" then Status() return end
 	if cmd == "where" or cmd == "spot" then
-		local e = Find(rest) or ui.selected
+		local e = Find(rest, true)
 		if not e then
 			Say("nobody called %q is on the board - select an enemy first. Client map reads: %s",
 				Clean(rest, MAX_NAME), MapProbeLine())
