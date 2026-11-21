@@ -1,0 +1,12 @@
+name: Shared addon window
+on: [push, pull_request]
+permissions:
+  contents: read
+
+jobs:
+  shared-window:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - run: sudo apt-get update && sudo apt-get install -y lua5.1
+      - run: lua5.1 tests/shared-window.lua
