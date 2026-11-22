@@ -9,9 +9,19 @@ Olympus Mytikas brings the guild's recruitment tools and Kill on Sight board int
 Once the CurseForge project is connected, publishing a stable GitHub release starts the upload. GitHub Actions builds the installable ZIP, attaches it to the release, and submits the same bytes to CurseForge. Member Home can continue importing the GitHub asset.
 
 1. Update `## Version` in `OlympusMytikas/OlympusMytikas.toc` and add the changes to `OlympusMytikas/CHANGELOG.txt`. If moving to a new Forever client version, update both the TOC and the supported Forever version in `scripts/publish_curseforge.py`. Merge the changes to `main` after **Addon behavior** passes.
-2. In GitHub Releases, select **Draft a new release**. Choose a new tag matching the manifest with a leading `v` (for example, `v1.0.2` for `1.0.2`), and target the reviewed commit on `main`. Enter the player-facing changes in the release notes. This text becomes the public CurseForge changelog. Leave the prerelease box unchecked. [Draft a GitHub release](https://github.com/Mytikas-Monster/OlympusMytikas/releases/new)
+2. In GitHub Releases, select **Draft a new release**. Choose a new tag matching the manifest with a leading `v` (for example, `v1.0.2` for `1.0.2`), and target the reviewed commit on `main`. Copy the reviewed version entry from the packaged changelog into the release body. Build the entry from the player-facing answers in merged PRs and reconcile it against the previous-tag comparison. This text becomes the public CurseForge changelog. Leave the prerelease box unchecked. [Draft a GitHub release](https://github.com/Mytikas-Monster/OlympusMytikas/releases/new)
 3. Click **Publish release**. Open **Actions → Publish to CurseForge** for the result. The release assets should include `OlympusMytikas-X.Y.Z.zip` and, once CurseForge accepts the upload, `curseforge-receipt.json` containing its file ID. [Workflow runs](https://github.com/Mytikas-Monster/OlympusMytikas/actions/workflows/publish-curseforge.yml)
 4. Open the file in the CurseForge author dashboard to see its moderation status. Once approved, check that the public Files page offers the tagged version for **WoW Forever**. A player can install it from the CurseForge app for their Forever installation. For a direct check, download the public file and compare its SHA-256 with the GitHub release asset digest. [CurseForge file submission and review](https://support.curseforge.com/support/solutions/articles/9000197241-creating-and-submitting-a-project)
+
+### Verify the release players receive
+
+Run `git ls-remote origin refs/tags/vX.Y.Z` before publication to confirm the tag is available. After publication, compare the remote tag SHA with the commit tested in the release-preparation PR. Keep the workflow run URL, receipt file ID and SHA-256 together.
+
+Check the author dashboard until the file clears Processing and Under Review. Open the project’s public Files page and confirm the version, Release type and Forever game version. Download that file and the GitHub asset into separate directories, then run `sha256sum` on both. A CDN download can succeed while moderation is pending.
+
+Back up the existing addon folder. Select **Forever** in the desktop app’s World of Warcraft dropdown. Use **Update** under **My Addons** if offered, or use **Browse** to find the project and install it. Check the installed version in the client and the TOC, compare the installed files to the ZIP, and keep existing character settings in `WTF`. Record the desktop result separately from the CDN check.
+
+For 1.0.2 the tested commit was `1f2539d`, the CurseForge file ID was `9753095`, and both download digests were `67fc6b1632dea15d6cda76a65154ac3df5216fc12d89b827fb738b4f6d348564`. [Publisher run](https://github.com/Mytikas-Monster/OlympusMytikas/actions/runs/45039085783) · [GitHub release](https://github.com/Mytikas-Monster/OlympusMytikas/releases/tag/v1.0.2) · [CurseForge file](https://www.curseforge.com/wow/addons/olympus-mytikas/files/9753095)
 
 ## Connect CurseForge for the first time
 
@@ -57,10 +67,7 @@ If the author confirms that no upload occurred, clear the pending marker for tha
 Run the Lua checks from the repository root with Lua 5.1. To test packaging without publishing, use a local release tag whose manifest has the matching version. The package commands use the tree stored in that tag.
 
 ```sh
-python3 -m unittest discover -s tests -p 'test_*.py' -v
-luac5.1 -p OlympusMytikas/*.lua OlympusMytikas/libs/*.lua
-lua5.1 tests/shared-window.lua
-lua5.1 tests/gameplay.lua
+./scripts/check.sh
 tag=v1.0.2
 archive_dir=$(mktemp -d)
 archive="$archive_dir/OlympusMytikas-${tag#v}.zip"
