@@ -1,6 +1,7 @@
 -- Lua 5.1 client fixtures. Only registered events, slash commands and the add
 -- dialog's bound callback drive changes to the actual modules' SavedVariables.
 local addon = "OlympusMytikas"
+dofile("tests/forever-map.lua")
 
 local function client(player, saved)
     local messages, sends, timers, frames = {}, {}, {}, {}
@@ -39,10 +40,39 @@ local function client(player, saved)
     return env, loadModule, event, messages, sends, timers
 end
 
+local function interleavedFragments()
+    local env, load = client({name = "Beta", realm = "Fixture"}, {})
+    local ns = load("KillOnSight")
+    env.IsInGuild = function() return true end
+    local function fragment(index, sender, body)
+        ns.OnAddonMessage("KOS", "C1:" .. index .. ":2:" .. body, "GUILD", sender)
+    end
+    fragment(1, "Alpha", "E~Player-1-00000001~")
+    fragment(1, "Gamma", "E~Player-1-00000002~")
+    fragment(2, "Gamma", "2~100~0~0~0~~Two")
+    fragment(2, "Alpha", "1~100~0~0~0~~One")
+    assert(ns.Entry("Player-1-00000001").name == "One")
+    assert(ns.Entry("Player-1-00000002").name == "Two")
+end
+interleavedFragments()
+
 local function expectLine(messages, pattern)
     local last = messages[#messages] or ""
     assert(last:find(pattern, 1, true), "expected '" .. pattern .. "', got '" .. last .. "'")
 end
+
+local function builtInAds()
+    local env, load, _, messages, sends = client({name = "Alpha", realm = "Fixture"}, {})
+    load("OlympusRecruit")
+    local command = env.SlashCmdList.OLYMPUSRECRUIT
+    command("profile")
+    local count = assert(tonumber(table.concat(messages):match("(%d+) in the pool")))
+    for index = 1, count do
+        command("pick " .. index)
+        assert(#sends == index * 2 and #sends[#sends][1] <= 255)
+    end
+end
+builtInAds()
 
 local function recruit()
     local player = { realm = "Fixture" }
@@ -94,6 +124,24 @@ local function recruit()
     event("PLAYER_ENTERING_WORLD")
     assert(#sends == 2, "Events and timers should not send additional posts")
 
+    local function echo(sender, channel)
+        event("CHAT_MSG_CHANNEL", stored.custom[2], sender, nil, nil, nil, nil, nil, channel)
+    end
+    command("pick " .. index)
+    echo("Other", 1)
+    echo("Beta-Elsewhere", 2)
+    echo("Beta-Fixture", 3)
+    timers[#timers]()
+    assert(messages[#messages - 1]:find("no echo", 1, true))
+    echo("Beta-Fixture", 1)
+    echo("Beta", 1)
+    timers[#timers]()
+    assert(messages[#messages - 1]:find("only one echo", 1, true))
+    echo("Beta", 2)
+    local before = #messages
+    timers[#timers]()
+    assert(#messages == before)
+
     local nextEnv, reload = client(player, {recruit = stored})
     reload("OlympusRecruit")
     local nextCommand = nextEnv.SlashCmdList.OLYMPUSRECRUIT
@@ -106,6 +154,35 @@ local function recruit()
     assert(stored.chars["Fixture-Alpha"].minimapAngle == 45)
     assert(stored.chars["Fixture-Alpha"].minimap == true)
 end
+
+local function monthly()
+    local player = {realm = "Fixture", name = "Officer", rank = "Valar", rankIndex = 1}
+    local saved = {}
+    local boundary = 1738368000 -- 2025-02-01 00:00 UTC
+    local function login(at)
+        local env, load, event = client(player, saved)
+        env.date, env.os = os.date, false
+        env.GetServerTime = function() return at end
+        local ns = load("KillOnSight")
+        event("ADDON_LOADED", addon)
+        event("PLAYER_LOGIN")
+        saved.kos = env.KillOnSightDB
+        return ns
+    end
+    local ns = login(boundary - 1)
+    assert(ns.BoardMonth(boundary - 1) == "2025-01")
+    local credit = {who = "Hunter", target = "Player-1-00000001", amount = 10000, at = boundary - 1}
+    assert(ns.ApplyBoardCredit(credit))
+    local board = ns.Store().board
+    board.month, board.ledger[1].month = "unknown", "unknown"
+    board.ledger[1].key = "unknown|hunter|" .. credit.target
+    ns = login(boundary)
+    assert(ns.Store().board.month == "2025-02" and ns.PastPrize().prize == 7000)
+    assert(ns.BoardPaid("Hunter", "Officer"))
+    ns = login(boundary)
+    assert(ns.Store().board.history[1].paid and ns.Store().bank.paid == 7000)
+end
+monthly()
 
 local function savedShapes()
     local player = {realm = "Fixture", name = "Beta"}
@@ -144,12 +221,71 @@ local function framing()
 end
 framing()
 
+local function offscreenSync()
+    local env, load = client({name = "Alpha", realm = "Fixture", faction = "Alliance", rankIndex = 0}, {})
+    local ns = load("KillOnSight")
+    local command, entries = env.SlashCmdList.KILLONSIGHT, ns.Store().entries
+    -- A guildmate first receives a name-only target, then its real player ID.
+    local peerEnv, peerLoad = client({name = "Beta", realm = "Fixture", faction = "Alliance"}, {})
+    local peer = peerLoad("KillOnSight")
+    peerEnv.IsInGuild = function() return true end
+    peerEnv.GetNumGuildMembers = function() return 1 end
+    peerEnv.GetGuildRosterInfo = function() return "Alpha", "Valar", 1 end
+    local function receive(row) peer.OnAddonMessage("KOS", row, "GUILD", "Alpha") end
+    command("add Offscreen 1")
+    local loose = entries["n:offscreen"]
+    local row = ns.RowFor(loose, true)
+    receive(row)
+    assert(peer.Entry(loose.guid) and peer.Entry(loose.guid).want == 10000)
+    assert(not peer.ApplyBoardCredit({who="Hunter", target=loose.guid, amount=10000, at=1800000000}))
+    assert(ns.Remove(loose.guid))
+    receive("R~n:offscreen~" .. ns.Store().removed["n:offscreen"])
+    assert(not peer.Entry("n:offscreen"))
+    command("add Offscreen 1")
+    row = ns.RowFor(entries["n:offscreen"], true)
+    receive(row)
+    local real = ns.AddKill("Player-1-ABCDEF11", "Offscreen", "MAGE")
+    receive(ns.RowFor(real, true))
+    receive(row) -- A delayed old digest must not resurrect the loose name.
+    assert(peer.Entry(real.guid) and not peer.Entry("n:offscreen"))
+    assert(ns.Remove(real.guid))
+    receive("R~" .. real.guid .. "~" .. ns.Store().removed[real.guid])
+    assert(not peer.Entry(real.guid))
+end
+offscreenSync()
+
 local function edit()
     return {
         text = "", SetText = function(self,v) self.text=v end,
         GetText = function(self) return self.text end, SetFocus = function() end,
     }
 end
+
+local function largeDigest()
+    local env, load = client({name = "Alpha", realm = "Fixture"}, {})
+    local ns = load("KillOnSight")
+    local receiverEnv, receiverLoad = client({name = "Beta", realm = "Fixture"}, {})
+    local receiver = receiverLoad("KillOnSight")
+    receiverEnv.IsInGuild = function() return true end
+    env.IsInGuild = function() return true end
+    local bytes, sets = 0, {}
+    env.SendAddonMessage = function(prefix, frame, channel)
+        local id, count = frame:match("^C(%d+):%d+:(%d+):")
+        if id then sets[id] = tonumber(count) end
+        bytes = bytes + #frame
+        receiver.OnAddonMessage(prefix, frame, channel, "Alpha")
+    end
+    for i = 1, 100 do
+        local id = ("Player-1-%08X"):format(i)
+        ns.Store().entries[id] = {victims = {}, claims = {}, guid = id, stamp = i, name = "Rival" .. i, reason = string.rep("x", 65)}
+    end
+    assert(ns.SendDigest(true))
+    for i = 1, 300 do ns.Pump() end
+    assert(bytes > 8400)
+    for _, count in pairs(sets) do assert(count <= 40) end
+    for id in pairs(ns.Store().entries) do assert(receiver.Entry(id)) end
+end
+largeDigest()
 
 local function board()
     local player = {realm = "Fixture", name = "Alpha", faction = "Alliance", rank = "Valar", rankIndex = 1}
@@ -205,6 +341,16 @@ local function board()
     assert(entries["n:regular"].funded == 12345 and ns.Store().bank.escrowed == 12500 and ns.Store().bank.float == 155)
     event("GUILDBANK_UPDATE_MONEY")
     assert(ns.Store().bank.escrowed == 12500 and not ns.reported)
+    command("add Partial 1")
+    command("fund Partial")
+    balance = balance + 5000
+    command("deposited")
+    event("GUILDBANK_UPDATE_MONEY")
+    assert(entries["n:partial"].funded == 0)
+    balance = balance + 5000
+    command("deposited")
+    event("GUILDBANK_UPDATE_MONEY")
+    assert(entries["n:partial"].funded == 10000 and ns.Store().bank.escrowed == 22500)
     ns.ui.selected = target
 
     for _, cmd in ipairs({"bounty", "fund", "remove", "where"}) do
@@ -229,6 +375,19 @@ local function board()
     login("ADDON_LOADED", addon)
     assert(not reloaded.reported and reloaded.Store().entries["n:other"].want == 1)
     assert(stored.cutPercent == 35 and stored.defaultReward == 12345 and stored.refundDays == 20)
+    local scope = reloaded.Store()
+    scope.bank.pool, scope.bank.paid = 7000, 3500
+    scope.board.ledger = {{who = "Alpha", amount = 10000}}
+    scope.board.award = {who = "Alpha", amount = 3500}
+    env2.SlashCmdList.KILLONSIGHT("reset")
+    local _, loadAgain, enter = client(player, {kos = stored})
+    local after = loadAgain("KillOnSight")
+    enter("ADDON_LOADED", addon)
+    local kept = after.Store()
+    assert(next(kept.entries) == nil and next(kept.removed) == nil)
+    assert(kept.bank.pool == 7000 and kept.bank.paid == 3500)
+    assert(kept.board.ledger[1].who == "Alpha" and kept.board.award.amount == 3500)
+    assert(#kept.audit == 1)
     env2.SlashCmdList.KILLONSIGHT("share")
     assert(stored.share == true)
 end

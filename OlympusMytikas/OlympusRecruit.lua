@@ -76,8 +76,8 @@ local ADS = {
 	"<Olympus Mytikas> We raid like people with jobs, not like gods with worshippers. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> The mountain doesn't make gods. It makes regulars. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> Highest peak on Olympus. We need climbers, not tourists. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
-	"<Olympus Mytikas> THE SUMMIT IS CLAIMED IN BLOOD! Join our ranks, crush our enemies, and carve your legend into Azeroth. Steel in our hands. Thunder in our hearts. No mercy. No surrender. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
-	"<Olympus Mytikas> Is Recruiting! This is Peak Olympus! Join for the events, the banter, and the shared disdain for the Red Menace. Other guilds discriminate based on Race and Class, but here you are an Equal. Here: You're an Olympian. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
+	"<Olympus Mytikas> THE SUMMIT IS CLAIMED IN BLOOD! Join our ranks, crush our enemies, and carve your legend into Azeroth. Steel in hand. Thunder in our hearts. No surrender. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
+	"<Olympus Mytikas> Is Recruiting! This is Peak Olympus! Join for the events, the banter, and the shared disdain for the Red Menace. Every race and class is welcome on Olympus. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> They say we want everyone on this server in the guild. They are right and you are behind schedule. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> They call it mass recruitment spam. We call it a queue. Read the ad, join the queue. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> They built an addon to mute us. Install it. We will still be raiding. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
@@ -292,7 +292,7 @@ local function PostAll(forceIndex, quiet)
 		return
 	end
 
-	local p = { texts = { [msg] = true }, sent = 0, seen = 0 }
+	local p = { text = msg, channels = {}, sent = 0, seen = 0 }
 	pending = p
 
 	-- THE POST: both channels, one pass, nothing between them
@@ -1164,8 +1164,16 @@ frame:SetScript("OnEvent", function(_, event, ...)
 	end
 	if event == "CHAT_MSG_CHANNEL" then
 		-- our own post comes back through here; that is the only proof it landed
-		local text = ...
-		if pending and pending.texts[text] then
+		local text, sender = ...
+		local channel = select(8, ...)
+		if Secret(text, sender, channel) or not pending or pending.text ~= text then return end
+		if channel ~= SLOT_GENERAL and channel ~= SLOT_TRADE then return end
+		local name = UnitName("player")
+		local realm = GetRealmName()
+		if Secret(name, realm) or not name then return end
+		local fullName = realm and name .. "-" .. realm:gsub("%s+", "")
+		if (sender == name or sender == fullName) and not pending.channels[channel] then
+			pending.channels[channel] = true
 			pending.seen = pending.seen + 1
 		end
 		return

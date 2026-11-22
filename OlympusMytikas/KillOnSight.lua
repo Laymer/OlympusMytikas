@@ -59,6 +59,7 @@ local PREFIX = ns.PREFIX
 local DEATH_WINDOW = 5
 local MSG_MAX = 250
 local CHUNK = 210
+local MAX_PARTS = 40
 local SEND_INTERVAL = 1.2
 local RETRY_WAIT = { 2, 4, 8, 15, 30 }
 local HELLO_EVERY = 600
@@ -147,8 +148,8 @@ end
 -- ends even when a PC clock is wrong. A guarded fallback keeps an odd client from breaking onboard.
 function Board.BoardMonth(at)
 	at = math.floor(tonumber(at) or 0)
-	if at > 0 and type(os) == "table" and type(os.date) == "function" then
-		local ok, value = pcall(os.date, "!%Y-%m", at)
+	if at > 0 and type(date) == "function" then
+		local ok, value = pcall(date, "!%Y-%m", at)
 		if ok and type(value) == "string" and value:match("^%d%d%d%d%-%d%d$") then return value end
 	end
 	return "unknown"
@@ -579,11 +580,19 @@ local function Fields(row)
 	return out
 end
 
+function Board.TargetID(value)
+	if type(value) == "string" and value:sub(1, 2) == "n:" then
+		local name = value:sub(3)
+		if name ~= "" and name == Clean(name, MAX_NAME):lower() then return value end
+	end
+	return Guid(value)
+end
+
 local function ParseEntry(row)
 	local f = Fields(row)
 	if f[1] ~= "E" then return nil end
-	local guid = Guid(f[2])
-	if not guid then return nil end
+	local guid = Board.TargetID(f[2])
+	if not guid or (guid:sub(1, 2) == "n:" and guid ~= "n:" .. Clean(f[9], MAX_NAME):lower()) then return nil end
 	local stamp = Num(f[3], 0, 4294967295)
 	if not stamp then return nil end
 	local e = {
@@ -1064,24 +1073,42 @@ function Board.BoardWinner(month)
 	return Board.BoardRanks(month)[1]
 end
 
+function Board.ArchiveMonth(b, month, now)
+	local winner = Board.BoardWinner(month)
+	if winner then
+		local h = { month = month, who = winner.who, count = winner.count,
+			amount = winner.amount, prize = Board.FundForMonth(month),
+			paid = false, by = "", at = math.floor(tonumber(now) or 0) }
+		local a = b.award
+		if a.month == month and SameName(a.who, winner.who) then
+			h.paid, h.by = true, a.by
+		end
+		b.history[#b.history + 1] = h
+		while #b.history > 12 do table.remove(b.history, 1) end
+	end
+end
+
 function Board.BoardRollover(now)
 	local b = Store().board
 	local month = Board.BoardMonth(now)
+	if month == "unknown" then return false end
 	if b.month == month then return false end
-	if b.month ~= "" and b.month ~= "unknown" then
-		local winner = Board.BoardWinner(b.month)
-		if winner then
-			local h = { month = b.month, who = winner.who, count = winner.count,
-				amount = winner.amount, prize = Board.FundForMonth(b.month),
-				paid = false, by = "", at = math.floor(tonumber(now) or 0) }
-			local a = b.award
-			if a.month == b.month and SameName(a.who, winner.who) then
-				h.paid, h.by = true, a.by
+	local closed = {}
+	if b.month == "unknown" or b.month == "" then
+		for _, rec in ipairs(b.ledger) do
+			if rec.month == "unknown" then
+				rec.month = Board.BoardMonth(rec.at)
+				rec.key = rec.month .. "|" .. rec.who:lower() .. "|" .. rec.target
 			end
-			b.history[#b.history + 1] = h
-			while #b.history > 12 do table.remove(b.history, 1) end
+			if rec.month ~= "unknown" and rec.month < month then closed[rec.month] = true end
 		end
+	elseif b.month < month then
+		closed[b.month] = true
 	end
+	local ordered = {}
+	for past in pairs(closed) do ordered[#ordered + 1] = past end
+	table.sort(ordered)
+	for _, past in ipairs(ordered) do Board.ArchiveMonth(b, past, now) end
 	b.month = month
 	local keep = {}
 	for i = 1, #b.ledger do
@@ -1542,7 +1569,16 @@ local function SendDigest(urgent)
 		end
 	end
 	if #rows == 0 then return false end
-	QueueParts(table.concat(rows, ";"), urgent)
+	local batch, bytes = {}, 0
+	for _, row in ipairs(rows) do
+		if bytes + #row + 1 > MAX_PARTS * CHUNK then
+			QueueParts(table.concat(batch, ";"), urgent)
+			batch, bytes = {}, 0
+		end
+		batch[#batch + 1] = row
+		bytes = bytes + #row + (#batch > 1 and 1 or 0)
+	end
+	QueueParts(table.concat(batch, ";"), urgent)
 	return true
 end
 
@@ -1570,19 +1606,6 @@ local function BankLedger()
 	return Store().bank
 end
 
--- A deposit is real when the bank's own gold went up by at least the amount since we last read it.
-local function BalanceRose(amount)
-	local now = BankMoney()
-	if not now then return false, "the guild bank's gold cannot be read right now" end
-	local seen = tonumber(DB().bank.seen)
-	DB().bank.seen = now
-	if not seen then return false, "there is no earlier reading of the bank to compare with" end
-	local delta = now - seen
-	if delta < amount then
-		return false, ("the bank rose by %s, not %s"):format(Money(math.max(0, delta)), Money(amount))
-	end
-	return true, delta
-end
 -- Arm a bounty: the entry becomes a pending job at once (stored and shared, so it survives a
 -- reload), then the addon watches the bank's gold for it. Arming pays nothing.
 local function Fund(entry)
@@ -1638,40 +1661,22 @@ local function ConfirmFunding(entry, delta)
 	return true
 end
 
--- The bank's gold moved while we were watching: a deposit we armed for becomes a bounty here.
-local function OnBankMoneyChanged()
+-- Both the event and the manual check consume the same balance reading once.
+local function ObserveDeposit()
 	local now = BankMoney()
-	if not now then return end
+	if not now then return false, "the guild bank's gold cannot be read right now" end
 	local seen = tonumber(DB().bank.seen)
 	DB().bank.seen = now
-	if not seen then return end
-	local delta = now - seen
-	if not armed or delta <= 0 then return end
-	if Mono() - (armed.at or 0) > 600 then armed = nil return end
-	local entry = Entry(armed.guid)
-	if not entry then armed = nil return end
-	local got, need = CreditArmed(delta)
-	if not got or got < need then
-		Say("the bank rose by %s - %s short of the %s needed for %s.",
-			Money(delta), Money(need - (got or 0)), Money(need), entry.name)
-		return
-	end
-	ConfirmFunding(entry, got)
-end
-
-local function TryArmFromManual()
 	if not armed then return false, "nothing is armed - /kos fund <name> first" end
+	if Mono() - armed.at > 600 then armed = nil return false, "arm the bounty again" end
 	local entry = Entry(armed.guid)
 	if not entry then armed = nil return false, "the entry is gone" end
-	local ok, delta = BalanceRose(armed.need)
-	if not ok then return false, delta end
-	local got, need = CreditArmed(delta)
-	if not got or got < need then
+	local got, need = CreditArmed(now - (seen or now))
+	if got < need then
 		return false, ("the bank has risen by %s of the %s needed - deposit the rest and try again.")
-			:format(Money(got or 0), Money(need or 0))
+			:format(Money(got), Money(need))
 	end
-	ConfirmFunding(entry, got)
-	return true
+	return ConfirmFunding(entry, got)
 end
 
 -- Start a bounty job from a name: instant, shared, and worth no money yet. Fund() stores and shares
@@ -1774,6 +1779,14 @@ local function ApplyEntry(remote)
 	local s = Store()
 	local tomb = s.removed[remote.guid]
 	if tomb and tonumber(tomb) >= remote.stamp then return false end
+	if Guid(remote.guid) and remote.name ~= "" then
+		local alias = "n:" .. remote.name:lower()
+		local loose = s.entries[alias]
+		if not loose or loose.stamp <= remote.stamp then
+			s.entries[alias] = nil
+			s.removed[alias] = math.max(s.removed[alias] or 0, remote.stamp)
+		end
+	end
 	local mine = s.entries[remote.guid]
 	local fresh = mine == nil
 	if mine then
@@ -1806,7 +1819,7 @@ end
 local function ApplyRemoval(row, sender)
 	if not Board.CanManage(sender) then return false end
 	local f = Fields(row)
-	local guid = Guid(f[2])
+	local guid = Board.TargetID(f[2])
 	local stamp = Num(f[3], 0, 4294967295)
 	if not guid or not stamp then return false end
 	local s = Store()
@@ -1876,12 +1889,18 @@ local function OnAddonMessage(prefix, text, dist, sender)
 	local id, index, count = text:match("^C(%d+):(%d+):(%d+):")
 	if id then
 		id, index, count = tonumber(id), tonumber(index), tonumber(count)
-		if not id or not index or not count or count < 1 or count > 40 or index < 1 or index > count then return end
+		if not id or not index or not count or count < 1 or count > MAX_PARTS or index < 1 or index > count then return end
 		local body = text:match("^C%d+:%d+:%d+:(.*)$") or ""
-		local slot = parts[id]
-		if not slot or slot.count ~= count or Mono() - slot.at > 30 then
+		if type(sender) ~= "string" or sender == "" then return end
+		local key = sender .. ":" .. id
+		local now = Mono()
+		for oldKey, old in pairs(parts) do
+			if now - old.at > 30 then parts[oldKey] = nil end
+		end
+		local slot = parts[key]
+		if not slot or slot.count ~= count then
 			slot = { count = count, got = {}, seen = 0, at = Mono() }
-			parts[id] = slot
+			parts[key] = slot
 		end
 		if not slot.got[index] then
 			slot.got[index] = body
@@ -1890,7 +1909,7 @@ local function OnAddonMessage(prefix, text, dist, sender)
 		if slot.seen == count then
 			local whole = {}
 			for i = 1, count do whole[i] = slot.got[i] or "" end
-			parts[id] = nil
+			parts[key] = nil
 			Handle(table.concat(whole), sender)
 		end
 		return
@@ -1966,7 +1985,7 @@ end
 local PoolKill
 
 local function ClaimKill(guid, who)
-	local e = Entry(guid)
+	local e = Entry(Guid(guid))
 	if not e or e.paid then return false, "paid" end
 	who = Clean(who or MyName(), MAX_NAME)
 	if (tonumber(e.funded) or 0) <= 0 then
@@ -3868,7 +3887,7 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "deposited" then
-		local ok, why = TryArmFromManual()
+		local ok, why = ObserveDeposit()
 		if not ok then Say("%s", tostring(why)) end
 		return
 	end
@@ -4103,7 +4122,8 @@ local function Handler(msg)
 	if cmd == "recap" then RecapDump() return end
 	if cmd == "reset" then
 		local s = Store()
-		DB().scopes[Scope()] = { entries = {}, removed = {}, deaths = s.deaths or {}, ver = 1 }
+		s.entries, s.removed = {}, {}
+		armed = nil
 		ui.selected = nil
 		MapLib.pinDirty = true
 		Say("this realm's board is wiped (the guild death history is kept).")
@@ -4254,7 +4274,7 @@ On("CHAT_MSG_GUILD", function(text, sender) OnGuildChat(text, sender) end)
 
 -- The bank: a baseline when it opens, and the moment its gold moves is the deposit we watch for.
 On("GUILDBANKFRAME_OPENED", function() BankSeen() end)
-On("GUILDBANK_UPDATE_MONEY", function() OnBankMoneyChanged() end)
+On("GUILDBANK_UPDATE_MONEY", function() ObserveDeposit() end)
 On("PLAYER_INTERACTION_MANAGER_FRAME_SHOW", function(kind) BankSeen() end)
 
 SLASH_KILLONSIGHT1 = "/kos"
@@ -4271,7 +4291,7 @@ ns.CaptureDeath = CaptureDeath
 ns.OnPlayerDead = OnPlayerDead
 ns.OnPartyKill = OnPartyKill
 ns.OnAddonMessage = OnAddonMessage
-ns.OnBankMoneyChanged = OnBankMoneyChanged
+ns.OnBankMoneyChanged = ObserveDeposit
 ns.ApplyEntry = ApplyEntry
 ns.ApplyRemoval = ApplyRemoval
 ns.ParseEntry = ParseEntry
@@ -4280,7 +4300,7 @@ ns.AddKill = AddKill
 ns.ClaimKill = ClaimKill
 ns.Fund = Fund
 ns.ConfirmFunding = ConfirmFunding
-ns.TryArmFromManual = TryArmFromManual
+ns.TryArmFromManual = ObserveDeposit
 ns.PoolKill = PoolKill
 ns.Refund = Refund
 ns.Expire = Expire
