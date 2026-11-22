@@ -1,3 +1,22 @@
+Olympus Mytikas 1.0.2 for WoW Forever 1.60.1
+
+- Monthly hunter prizes use UTC month boundaries. Dated credits saved under “unknown” are recovered before rollover, and officers can record the archived prize after a reload. Officer audit timestamps now display in Forever. [#5](https://github.com/Mytikas-Monster/OlympusMytikas/pull/5) [#15](https://github.com/Mytikas-Monster/OlympusMytikas/pull/15)
+- Clearing targets with /kos reset preserves hunter credits, prize pools, payments, guild deaths and the audit log. [#4](https://github.com/Mytikas-Monster/OlympusMytikas/pull/4)
+- Partial deposits accumulate across /kos deposited and guild bank updates. Seeing the same balance twice credits it once. [#6](https://github.com/Mytikas-Monster/OlympusMytikas/pull/6)
+- Guildmates can share and remove offscreen targets by name. The board reconciles the name when a player GUID becomes available, and kill credit requires a real player GUID. [#11](https://github.com/Mytikas-Monster/OlympusMytikas/pull/11)
+- Guild sync now delivers messages around the 210-byte boundary intact, separates simultaneous sends from different players and splits large boards at row boundaries so 1.0.1 peers can receive them before their timeout. [#8](https://github.com/Mytikas-Monster/OlympusMytikas/pull/8) [#9](https://github.com/Mytikas-Monster/OlympusMytikas/pull/9) [#13](https://github.com/Mytikas-Monster/OlympusMytikas/pull/13) [#14](https://github.com/Mytikas-Monster/OlympusMytikas/pull/14)
+- Map pins use Forever’s world coordinates. The package includes HereBeDragons 2.18 core and its BSD redistribution notice. [#10](https://github.com/Mytikas-Monster/OlympusMytikas/pull/10)
+- Bounty entry and reward settings accept fractional gold down to one copper and enforce copper bounds. The add dialog preserves fractional defaults, malformed legacy rewards recover safely, and /kos add keeps the reason when gold is omitted. Commands report an unknown named target instead of acting on the selected row. [#2](https://github.com/Mytikas-Monster/OlympusMytikas/pull/2)
+- Recruitment ads 32 and 33 fit the channel limit at their original positions. Delivery checks recognize your own matching post once per intended channel, and posting works when echo timers are unavailable. [#7](https://github.com/Mytikas-Monster/OlympusMytikas/pull/7) [#12](https://github.com/Mytikas-Monster/OlympusMytikas/pull/12) [#2](https://github.com/Mytikas-Monster/OlympusMytikas/pull/2)
+- Custom ad deletion requires a whole-number position, and the length warning counts bytes. Recruit recovers malformed saved profiles and the /om reset notice explains that custom ads are shared account-wide. [#2](https://github.com/Mytikas-Monster/OlympusMytikas/pull/2)
+
+Testing, packaging and publishing
+
+- Lua 5.1 checks cover the shared window, installed version, selectable Member Home link, tab switching, saved profiles and gameplay. New regression fixtures exercise UTC rollover, bank accounting, guild sync, recruitment and map coordinates. [#1](https://github.com/Mytikas-Monster/OlympusMytikas/pull/1) [#2](https://github.com/Mytikas-Monster/OlympusMytikas/pull/2)
+- The CurseForge publisher verifies the tagged addon and GitHub ZIP, uploads the same asset and release notes for Forever, and records a receipt to support safe retries. Python tests cover packaging, release preparation and submission. [#3](https://github.com/Mytikas-Monster/OlympusMytikas/pull/3)
+
+[Full comparison from v1.0.1 to v1.0.2](https://github.com/Mytikas-Monster/OlympusMytikas/compare/v1.0.1...v1.0.2)
+
 1.0.1 - Show installed version and a selectable Member Home URL in the shared window.
 
 Olympus Mytikas 1.0.0 - the two addons are now one
