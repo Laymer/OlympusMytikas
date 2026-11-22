@@ -292,7 +292,7 @@ local function PostAll(forceIndex, quiet)
 		return
 	end
 
-	local p = { texts = { [msg] = true }, sent = 0, seen = 0 }
+	local p = { text = msg, channels = {}, sent = 0, seen = 0 }
 	pending = p
 
 	-- THE POST: both channels, one pass, nothing between them
@@ -1164,8 +1164,16 @@ frame:SetScript("OnEvent", function(_, event, ...)
 	end
 	if event == "CHAT_MSG_CHANNEL" then
 		-- our own post comes back through here; that is the only proof it landed
-		local text = ...
-		if pending and pending.texts[text] then
+		local text, sender = ...
+		local channel = select(8, ...)
+		if Secret(text, sender, channel) or not pending or pending.text ~= text then return end
+		if channel ~= SLOT_GENERAL and channel ~= SLOT_TRADE then return end
+		local name = UnitName("player")
+		local realm = GetRealmName()
+		if Secret(name, realm) or not name then return end
+		local fullName = realm and name .. "-" .. realm:gsub("%s+", "")
+		if (sender == name or sender == fullName) and not pending.channels[channel] then
+			pending.channels[channel] = true
 			pending.seen = pending.seen + 1
 		end
 		return
