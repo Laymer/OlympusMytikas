@@ -1880,10 +1880,16 @@ local function OnAddonMessage(prefix, text, dist, sender)
 		id, index, count = tonumber(id), tonumber(index), tonumber(count)
 		if not id or not index or not count or count < 1 or count > MAX_PARTS or index < 1 or index > count then return end
 		local body = text:match("^C%d+:%d+:%d+:(.*)$") or ""
-		local slot = parts[id]
-		if not slot or slot.count ~= count or Mono() - slot.at > 30 then
+		if type(sender) ~= "string" or sender == "" then return end
+		local key = sender .. ":" .. id
+		local now = Mono()
+		for oldKey, old in pairs(parts) do
+			if now - old.at > 30 then parts[oldKey] = nil end
+		end
+		local slot = parts[key]
+		if not slot or slot.count ~= count then
 			slot = { count = count, got = {}, seen = 0, at = Mono() }
-			parts[id] = slot
+			parts[key] = slot
 		end
 		if not slot.got[index] then
 			slot.got[index] = body
@@ -1892,7 +1898,7 @@ local function OnAddonMessage(prefix, text, dist, sender)
 		if slot.seen == count then
 			local whole = {}
 			for i = 1, count do whole[i] = slot.got[i] or "" end
-			parts[id] = nil
+			parts[key] = nil
 			Handle(table.concat(whole), sender)
 		end
 		return

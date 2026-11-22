@@ -39,6 +39,22 @@ local function client(player, saved)
     return env, loadModule, event, messages, sends, timers
 end
 
+local function interleavedFragments()
+    local env, load = client({name = "Beta", realm = "Fixture"}, {})
+    local ns = load("KillOnSight")
+    env.IsInGuild = function() return true end
+    local function fragment(index, sender, body)
+        ns.OnAddonMessage("KOS", "C1:" .. index .. ":2:" .. body, "GUILD", sender)
+    end
+    fragment(1, "Alpha", "E~Player-1-00000001~")
+    fragment(1, "Gamma", "E~Player-1-00000002~")
+    fragment(2, "Gamma", "2~100~0~0~0~~Two")
+    fragment(2, "Alpha", "1~100~0~0~0~~One")
+    assert(ns.Entry("Player-1-00000001").name == "One")
+    assert(ns.Entry("Player-1-00000002").name == "Two")
+end
+interleavedFragments()
+
 local function expectLine(messages, pattern)
     local last = messages[#messages] or ""
     assert(last:find(pattern, 1, true), "expected '" .. pattern .. "', got '" .. last .. "'")
