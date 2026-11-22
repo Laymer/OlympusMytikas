@@ -2,7 +2,7 @@
 ## Title: |cffca9455Olympus|r Mytikas
 ## Notes: Recruitment ads and the guild kill board in ONE window with two tabs. Recruit posts to /1 General and /2 Trade in one pass and copies /ginvite for you to press (Forever forbids addon invites). Kill on Sight tracks enemies who kill guild members, escrowed 3g bounties verified against the guild bank, the monthly hunter prize pool and shared map pins. Every command still works: /om ... and /kos ... . Left click the minimap button for the window, right click posts a random ad.
 ## Author: Beast
-## Version: 1.0.1
+## Version: 1.0.2
 ## SavedVariables: OlympusRecruitDB, KillOnSightDB, OlympusMytikasDB
 ## X-Category: Guild
 
