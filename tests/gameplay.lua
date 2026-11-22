@@ -107,6 +107,35 @@ local function recruit()
     assert(stored.chars["Fixture-Alpha"].minimap == true)
 end
 
+local function monthly()
+    local player = {realm = "Fixture", name = "Officer", rank = "Valar", rankIndex = 1}
+    local saved = {}
+    local boundary = 1738368000 -- 2025-02-01 00:00 UTC
+    local function login(at)
+        local env, load, event = client(player, saved)
+        env.date, env.os = os.date, false
+        env.GetServerTime = function() return at end
+        local ns = load("KillOnSight")
+        event("ADDON_LOADED", addon)
+        event("PLAYER_LOGIN")
+        saved.kos = env.KillOnSightDB
+        return ns
+    end
+    local ns = login(boundary - 1)
+    assert(ns.BoardMonth(boundary - 1) == "2025-01")
+    local credit = {who = "Hunter", target = "Player-1-00000001", amount = 10000, at = boundary - 1}
+    assert(ns.ApplyBoardCredit(credit))
+    local board = ns.Store().board
+    board.month, board.ledger[1].month = "unknown", "unknown"
+    board.ledger[1].key = "unknown|hunter|" .. credit.target
+    ns = login(boundary)
+    assert(ns.Store().board.month == "2025-02" and ns.PastPrize().prize == 7000)
+    assert(ns.BoardPaid("Hunter", "Officer"))
+    ns = login(boundary)
+    assert(ns.Store().board.history[1].paid and ns.Store().bank.paid == 7000)
+end
+monthly()
+
 local function savedShapes()
     local player = {realm = "Fixture", name = "Beta"}
     for _, old in ipairs({
