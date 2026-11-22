@@ -131,6 +131,32 @@ local function edit()
     }
 end
 
+local function largeDigest()
+    local env, load = client({name = "Alpha", realm = "Fixture"}, {})
+    local ns = load("KillOnSight")
+    local receiverEnv, receiverLoad = client({name = "Beta", realm = "Fixture"}, {})
+    local receiver = receiverLoad("KillOnSight")
+    receiverEnv.IsInGuild = function() return true end
+    env.IsInGuild = function() return true end
+    local bytes, sets = 0, {}
+    env.SendAddonMessage = function(prefix, frame, channel)
+        local id, count = frame:match("^C(%d+):%d+:(%d+):")
+        if id then sets[id] = tonumber(count) end
+        bytes = bytes + #frame
+        receiver.OnAddonMessage(prefix, frame, channel, "Alpha")
+    end
+    for i = 1, 100 do
+        local id = ("Player-1-%08X"):format(i)
+        ns.Store().entries[id] = {victims = {}, claims = {}, guid = id, stamp = i, name = "Rival" .. i, reason = string.rep("x", 65)}
+    end
+    assert(ns.SendDigest(true))
+    for i = 1, 300 do ns.Pump() end
+    assert(bytes > 8400)
+    for _, count in pairs(sets) do assert(count <= 40) end
+    for id in pairs(ns.Store().entries) do assert(receiver.Entry(id)) end
+end
+largeDigest()
+
 local function board()
     local player = {realm = "Fixture", name = "Alpha", faction = "Alliance", rank = "Valar", rankIndex = 1}
     local oldEntry = {kills = 3, funded = 45000, want = 70000}

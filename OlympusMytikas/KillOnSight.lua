@@ -59,6 +59,7 @@ local PREFIX = ns.PREFIX
 local DEATH_WINDOW = 5
 local MSG_MAX = 250
 local CHUNK = 210
+local MAX_PARTS = 40
 local SEND_INTERVAL = 1.2
 local RETRY_WAIT = { 2, 4, 8, 15, 30 }
 local HELLO_EVERY = 600
@@ -1547,7 +1548,16 @@ local function SendDigest(urgent)
 		end
 	end
 	if #rows == 0 then return false end
-	QueueParts(table.concat(rows, ";"), urgent)
+	local batch, bytes = {}, 0
+	for _, row in ipairs(rows) do
+		if bytes + #row + 1 > MAX_PARTS * CHUNK then
+			QueueParts(table.concat(batch, ";"), urgent)
+			batch, bytes = {}, 0
+		end
+		batch[#batch + 1] = row
+		bytes = bytes + #row + (#batch > 1 and 1 or 0)
+	end
+	QueueParts(table.concat(batch, ";"), urgent)
 	return true
 end
 
@@ -1881,7 +1891,7 @@ local function OnAddonMessage(prefix, text, dist, sender)
 	local id, index, count = text:match("^C(%d+):(%d+):(%d+):")
 	if id then
 		id, index, count = tonumber(id), tonumber(index), tonumber(count)
-		if not id or not index or not count or count < 1 or count > 40 or index < 1 or index > count then return end
+		if not id or not index or not count or count < 1 or count > MAX_PARTS or index < 1 or index > count then return end
 		local body = text:match("^C%d+:%d+:%d+:(.*)$") or ""
 		local slot = parts[id]
 		if not slot or slot.count ~= count or Mono() - slot.at > 30 then
