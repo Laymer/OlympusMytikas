@@ -44,6 +44,19 @@ local function expectLine(messages, pattern)
     assert(last:find(pattern, 1, true), "expected '" .. pattern .. "', got '" .. last .. "'")
 end
 
+local function builtInAds()
+    local env, load, _, messages, sends = client({name = "Alpha", realm = "Fixture"}, {})
+    load("OlympusRecruit")
+    local command = env.SlashCmdList.OLYMPUSRECRUIT
+    command("profile")
+    local count = assert(tonumber(table.concat(messages):match("(%d+) in the pool")))
+    for index = 1, count do
+        command("pick " .. index)
+        assert(#sends == index * 2 and #sends[#sends][1] <= 255)
+    end
+end
+builtInAds()
+
 local function recruit()
     local player = { realm = "Fixture" }
     local stored = { custom = {"<Olympus Mytikas> Existing ad"}, minimap = false, minimapAngle = 45 }
