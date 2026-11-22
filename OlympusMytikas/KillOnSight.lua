@@ -147,8 +147,8 @@ end
 -- ends even when a PC clock is wrong. A guarded fallback keeps an odd client from breaking onboard.
 function Board.BoardMonth(at)
 	at = math.floor(tonumber(at) or 0)
-	if at > 0 and type(os) == "table" and type(os.date) == "function" then
-		local ok, value = pcall(os.date, "!%Y-%m", at)
+	if at > 0 and type(date) == "function" then
+		local ok, value = pcall(date, "!%Y-%m", at)
 		if ok and type(value) == "string" and value:match("^%d%d%d%d%-%d%d$") then return value end
 	end
 	return "unknown"
@@ -1069,24 +1069,42 @@ function Board.BoardWinner(month)
 	return Board.BoardRanks(month)[1]
 end
 
+function Board.ArchiveMonth(b, month, now)
+	local winner = Board.BoardWinner(month)
+	if winner then
+		local h = { month = month, who = winner.who, count = winner.count,
+			amount = winner.amount, prize = Board.FundForMonth(month),
+			paid = false, by = "", at = math.floor(tonumber(now) or 0) }
+		local a = b.award
+		if a.month == month and SameName(a.who, winner.who) then
+			h.paid, h.by = true, a.by
+		end
+		b.history[#b.history + 1] = h
+		while #b.history > 12 do table.remove(b.history, 1) end
+	end
+end
+
 function Board.BoardRollover(now)
 	local b = Store().board
 	local month = Board.BoardMonth(now)
+	if month == "unknown" then return false end
 	if b.month == month then return false end
-	if b.month ~= "" and b.month ~= "unknown" then
-		local winner = Board.BoardWinner(b.month)
-		if winner then
-			local h = { month = b.month, who = winner.who, count = winner.count,
-				amount = winner.amount, prize = Board.FundForMonth(b.month),
-				paid = false, by = "", at = math.floor(tonumber(now) or 0) }
-			local a = b.award
-			if a.month == b.month and SameName(a.who, winner.who) then
-				h.paid, h.by = true, a.by
+	local closed = {}
+	if b.month == "unknown" or b.month == "" then
+		for _, rec in ipairs(b.ledger) do
+			if rec.month == "unknown" then
+				rec.month = Board.BoardMonth(rec.at)
+				rec.key = rec.month .. "|" .. rec.who:lower() .. "|" .. rec.target
 			end
-			b.history[#b.history + 1] = h
-			while #b.history > 12 do table.remove(b.history, 1) end
+			if rec.month ~= "unknown" and rec.month < month then closed[rec.month] = true end
 		end
+	elseif b.month < month then
+		closed[b.month] = true
 	end
+	local ordered = {}
+	for past in pairs(closed) do ordered[#ordered + 1] = past end
+	table.sort(ordered)
+	for _, past in ipairs(ordered) do Board.ArchiveMonth(b, past, now) end
 	b.month = month
 	local keep = {}
 	for i = 1, #b.ledger do
