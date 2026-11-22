@@ -1575,19 +1575,6 @@ local function BankLedger()
 	return Store().bank
 end
 
--- A deposit is real when the bank's own gold went up by at least the amount since we last read it.
-local function BalanceRose(amount)
-	local now = BankMoney()
-	if not now then return false, "the guild bank's gold cannot be read right now" end
-	local seen = tonumber(DB().bank.seen)
-	DB().bank.seen = now
-	if not seen then return false, "there is no earlier reading of the bank to compare with" end
-	local delta = now - seen
-	if delta < amount then
-		return false, ("the bank rose by %s, not %s"):format(Money(math.max(0, delta)), Money(amount))
-	end
-	return true, delta
-end
 -- Arm a bounty: the entry becomes a pending job at once (stored and shared, so it survives a
 -- reload), then the addon watches the bank's gold for it. Arming pays nothing.
 local function Fund(entry)
@@ -1643,40 +1630,22 @@ local function ConfirmFunding(entry, delta)
 	return true
 end
 
--- The bank's gold moved while we were watching: a deposit we armed for becomes a bounty here.
-local function OnBankMoneyChanged()
+-- Both the event and the manual check consume the same balance reading once.
+local function ObserveDeposit()
 	local now = BankMoney()
-	if not now then return end
+	if not now then return false, "the guild bank's gold cannot be read right now" end
 	local seen = tonumber(DB().bank.seen)
 	DB().bank.seen = now
-	if not seen then return end
-	local delta = now - seen
-	if not armed or delta <= 0 then return end
-	if Mono() - (armed.at or 0) > 600 then armed = nil return end
-	local entry = Entry(armed.guid)
-	if not entry then armed = nil return end
-	local got, need = CreditArmed(delta)
-	if not got or got < need then
-		Say("the bank rose by %s - %s short of the %s needed for %s.",
-			Money(delta), Money(need - (got or 0)), Money(need), entry.name)
-		return
-	end
-	ConfirmFunding(entry, got)
-end
-
-local function TryArmFromManual()
 	if not armed then return false, "nothing is armed - /kos fund <name> first" end
+	if Mono() - armed.at > 600 then armed = nil return false, "arm the bounty again" end
 	local entry = Entry(armed.guid)
 	if not entry then armed = nil return false, "the entry is gone" end
-	local ok, delta = BalanceRose(armed.need)
-	if not ok then return false, delta end
-	local got, need = CreditArmed(delta)
-	if not got or got < need then
+	local got, need = CreditArmed(now - (seen or now))
+	if got < need then
 		return false, ("the bank has risen by %s of the %s needed - deposit the rest and try again.")
-			:format(Money(got or 0), Money(need or 0))
+			:format(Money(got), Money(need))
 	end
-	ConfirmFunding(entry, got)
-	return true
+	return ConfirmFunding(entry, got)
 end
 
 -- Start a bounty job from a name: instant, shared, and worth no money yet. Fund() stores and shares
@@ -3873,7 +3842,7 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "deposited" then
-		local ok, why = TryArmFromManual()
+		local ok, why = ObserveDeposit()
 		if not ok then Say("%s", tostring(why)) end
 		return
 	end
@@ -4259,7 +4228,7 @@ On("CHAT_MSG_GUILD", function(text, sender) OnGuildChat(text, sender) end)
 
 -- The bank: a baseline when it opens, and the moment its gold moves is the deposit we watch for.
 On("GUILDBANKFRAME_OPENED", function() BankSeen() end)
-On("GUILDBANK_UPDATE_MONEY", function() OnBankMoneyChanged() end)
+On("GUILDBANK_UPDATE_MONEY", function() ObserveDeposit() end)
 On("PLAYER_INTERACTION_MANAGER_FRAME_SHOW", function(kind) BankSeen() end)
 
 SLASH_KILLONSIGHT1 = "/kos"
@@ -4276,7 +4245,7 @@ ns.CaptureDeath = CaptureDeath
 ns.OnPlayerDead = OnPlayerDead
 ns.OnPartyKill = OnPartyKill
 ns.OnAddonMessage = OnAddonMessage
-ns.OnBankMoneyChanged = OnBankMoneyChanged
+ns.OnBankMoneyChanged = ObserveDeposit
 ns.ApplyEntry = ApplyEntry
 ns.ApplyRemoval = ApplyRemoval
 ns.ParseEntry = ParseEntry
@@ -4285,7 +4254,7 @@ ns.AddKill = AddKill
 ns.ClaimKill = ClaimKill
 ns.Fund = Fund
 ns.ConfirmFunding = ConfirmFunding
-ns.TryArmFromManual = TryArmFromManual
+ns.TryArmFromManual = ObserveDeposit
 ns.PoolKill = PoolKill
 ns.Refund = Refund
 ns.Expire = Expire

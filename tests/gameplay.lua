@@ -185,6 +185,16 @@ local function board()
     assert(entries["n:regular"].funded == 12345 and ns.Store().bank.escrowed == 12500 and ns.Store().bank.float == 155)
     event("GUILDBANK_UPDATE_MONEY")
     assert(ns.Store().bank.escrowed == 12500 and not ns.reported)
+    command("add Partial 1")
+    command("fund Partial")
+    balance = balance + 5000
+    command("deposited")
+    event("GUILDBANK_UPDATE_MONEY")
+    assert(entries["n:partial"].funded == 0)
+    balance = balance + 5000
+    command("deposited")
+    event("GUILDBANK_UPDATE_MONEY")
+    assert(entries["n:partial"].funded == 10000 and ns.Store().bank.escrowed == 22500)
     ns.ui.selected = target
 
     for _, cmd in ipairs({"bounty", "fund", "remove", "where"}) do
