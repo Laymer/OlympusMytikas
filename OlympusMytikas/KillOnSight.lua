@@ -4108,7 +4108,8 @@ local function Handler(msg)
 	if cmd == "recap" then RecapDump() return end
 	if cmd == "reset" then
 		local s = Store()
-		DB().scopes[Scope()] = { entries = {}, removed = {}, deaths = s.deaths or {}, ver = 1 }
+		s.entries, s.removed = {}, {}
+		armed = nil
 		ui.selected = nil
 		MapLib.pinDirty = true
 		Say("this realm's board is wiped (the guild death history is kept).")

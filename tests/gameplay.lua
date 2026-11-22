@@ -209,6 +209,19 @@ local function board()
     login("ADDON_LOADED", addon)
     assert(not reloaded.reported and reloaded.Store().entries["n:other"].want == 1)
     assert(stored.cutPercent == 35 and stored.defaultReward == 12345 and stored.refundDays == 20)
+    local scope = reloaded.Store()
+    scope.bank.pool, scope.bank.paid = 7000, 3500
+    scope.board.ledger = {{who = "Alpha", amount = 10000}}
+    scope.board.award = {who = "Alpha", amount = 3500}
+    env2.SlashCmdList.KILLONSIGHT("reset")
+    local _, loadAgain, enter = client(player, {kos = stored})
+    local after = loadAgain("KillOnSight")
+    enter("ADDON_LOADED", addon)
+    local kept = after.Store()
+    assert(next(kept.entries) == nil and next(kept.removed) == nil)
+    assert(kept.bank.pool == 7000 and kept.bank.paid == 3500)
+    assert(kept.board.ledger[1].who == "Alpha" and kept.board.award.amount == 3500)
+    assert(#kept.audit == 1)
     env2.SlashCmdList.KILLONSIGHT("share")
     assert(stored.share == true)
 end
