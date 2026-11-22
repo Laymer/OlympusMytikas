@@ -674,19 +674,14 @@ end
 local function QueueParts(payload, urgent)
 	-- One payload is one chunk set: every part must carry the SAME id or the receiver files each part
 	-- under its own set and never assembles any of them.
-	local cid
-	if #payload > MSG_MAX then
+	if #payload <= MSG_MAX then
+		queue[#queue + 1] = payload
+	else
 		chunkID = (chunkID + 1) % 1000
-		cid = chunkID
-	end
-	for i = 1, #payload, CHUNK do
-		local body = payload:sub(i, i + CHUNK - 1)
-		if not cid then
-			queue[#queue + 1] = body
-		else
-			local count = math.ceil(#payload / CHUNK)
-			local index = math.floor(i / CHUNK) + 1
-			queue[#queue + 1] = ("C%d:%d:%d:%s"):format(cid, index, count, body)
+		local count = math.ceil(#payload / CHUNK)
+		for index = 1, count do
+			local body = payload:sub((index - 1) * CHUNK + 1, index * CHUNK)
+			queue[#queue + 1] = ("C%d:%d:%d:%s"):format(chunkID, index, count, body)
 		end
 	end
 	while #queue > MAX_QUEUE do table.remove(queue, 1) end

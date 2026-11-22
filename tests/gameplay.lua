@@ -201,6 +201,26 @@ local function savedShapes()
     end
 end
 
+local function framing()
+    local env, load = client({name = "Alpha", realm = "Fixture"}, {})
+    local ns = load("KillOnSight")
+    env.IsInGuild = function() return true end
+    for _, size in ipairs({210, 211, 250, 251}) do
+        local wire = {}
+        env.SendAddonMessage = function(_, part) wire[#wire + 1] = part end
+        local payload = string.rep("x", size)
+        ns.QueueParts(payload, true)
+        for i = 1, 3 do ns.Pump() end
+        if size <= 250 then
+            assert(#wire == 1 and wire[1] == payload)
+        else
+            assert(#wire == 2 and wire[1]:match("^C%d+:1:2:") and wire[2]:match("^C%d+:2:2:"))
+            assert(wire[1]:match("^C%d+:1:2:(.*)") .. wire[2]:match("^C%d+:2:2:(.*)") == payload)
+        end
+    end
+end
+framing()
+
 local function offscreenSync()
     local env, load = client({name = "Alpha", realm = "Fixture", faction = "Alliance", rankIndex = 0}, {})
     local ns = load("KillOnSight")
