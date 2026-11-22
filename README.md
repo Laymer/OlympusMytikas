@@ -1,5 +1,7 @@
 # Olympus Mytikas
 
+For bug reports, checkout setup and local testing, see [Contributing](CONTRIBUTING.md).
+
 Olympus Mytikas brings the guild's recruitment tools and Kill on Sight board into one World of Warcraft addon. Open its window from the minimap to post a recruitment message, review enemy sightings and bounties, or see the installed version.
 
 ## Publish a release
