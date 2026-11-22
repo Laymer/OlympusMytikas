@@ -1,6 +1,7 @@
 -- Lua 5.1 client fixtures. Only registered events, slash commands and the add
 -- dialog's bound callback drive changes to the actual modules' SavedVariables.
 local addon = "OlympusMytikas"
+dofile("tests/forever-map.lua")
 
 local function client(player, saved)
     local messages, sends, timers, frames = {}, {}, {}, {}
