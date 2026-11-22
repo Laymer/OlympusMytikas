@@ -183,6 +183,39 @@ local function savedShapes()
     end
 end
 
+local function offscreenSync()
+    local env, load = client({name = "Alpha", realm = "Fixture", faction = "Alliance", rankIndex = 0}, {})
+    local ns = load("KillOnSight")
+    local command, entries = env.SlashCmdList.KILLONSIGHT, ns.Store().entries
+    -- A guildmate first receives a name-only target, then its real player ID.
+    local peerEnv, peerLoad = client({name = "Beta", realm = "Fixture", faction = "Alliance"}, {})
+    local peer = peerLoad("KillOnSight")
+    peerEnv.IsInGuild = function() return true end
+    peerEnv.GetNumGuildMembers = function() return 1 end
+    peerEnv.GetGuildRosterInfo = function() return "Alpha", "Valar", 1 end
+    local function receive(row) peer.OnAddonMessage("KOS", row, "GUILD", "Alpha") end
+    command("add Offscreen 1")
+    local loose = entries["n:offscreen"]
+    local row = ns.RowFor(loose, true)
+    receive(row)
+    assert(peer.Entry(loose.guid) and peer.Entry(loose.guid).want == 10000)
+    assert(not peer.ApplyBoardCredit({who="Hunter", target=loose.guid, amount=10000, at=1800000000}))
+    assert(ns.Remove(loose.guid))
+    receive("R~n:offscreen~" .. ns.Store().removed["n:offscreen"])
+    assert(not peer.Entry("n:offscreen"))
+    command("add Offscreen 1")
+    row = ns.RowFor(entries["n:offscreen"], true)
+    receive(row)
+    local real = ns.AddKill("Player-1-ABCDEF11", "Offscreen", "MAGE")
+    receive(ns.RowFor(real, true))
+    receive(row) -- A delayed old digest must not resurrect the loose name.
+    assert(peer.Entry(real.guid) and not peer.Entry("n:offscreen"))
+    assert(ns.Remove(real.guid))
+    receive("R~" .. real.guid .. "~" .. ns.Store().removed[real.guid])
+    assert(not peer.Entry(real.guid))
+end
+offscreenSync()
+
 local function edit()
     return {
         text = "", SetText = function(self,v) self.text=v end,
