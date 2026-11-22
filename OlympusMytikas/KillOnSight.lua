@@ -579,11 +579,19 @@ local function Fields(row)
 	return out
 end
 
+function Board.TargetID(value)
+	if type(value) == "string" and value:sub(1, 2) == "n:" then
+		local name = value:sub(3)
+		if name ~= "" and name == Clean(name, MAX_NAME):lower() then return value end
+	end
+	return Guid(value)
+end
+
 local function ParseEntry(row)
 	local f = Fields(row)
 	if f[1] ~= "E" then return nil end
-	local guid = Guid(f[2])
-	if not guid then return nil end
+	local guid = Board.TargetID(f[2])
+	if not guid or (guid:sub(1, 2) == "n:" and guid ~= "n:" .. Clean(f[9], MAX_NAME):lower()) then return nil end
 	local stamp = Num(f[3], 0, 4294967295)
 	if not stamp then return nil end
 	local e = {
@@ -1779,6 +1787,14 @@ local function ApplyEntry(remote)
 	local s = Store()
 	local tomb = s.removed[remote.guid]
 	if tomb and tonumber(tomb) >= remote.stamp then return false end
+	if Guid(remote.guid) and remote.name ~= "" then
+		local alias = "n:" .. remote.name:lower()
+		local loose = s.entries[alias]
+		if not loose or loose.stamp <= remote.stamp then
+			s.entries[alias] = nil
+			s.removed[alias] = math.max(s.removed[alias] or 0, remote.stamp)
+		end
+	end
 	local mine = s.entries[remote.guid]
 	local fresh = mine == nil
 	if mine then
@@ -1811,7 +1827,7 @@ end
 local function ApplyRemoval(row, sender)
 	if not Board.CanManage(sender) then return false end
 	local f = Fields(row)
-	local guid = Guid(f[2])
+	local guid = Board.TargetID(f[2])
 	local stamp = Num(f[3], 0, 4294967295)
 	if not guid or not stamp then return false end
 	local s = Store()
@@ -1971,7 +1987,7 @@ end
 local PoolKill
 
 local function ClaimKill(guid, who)
-	local e = Entry(guid)
+	local e = Entry(Guid(guid))
 	if not e or e.paid then return false, "paid" end
 	who = Clean(who or MyName(), MAX_NAME)
 	if (tonumber(e.funded) or 0) <= 0 then
