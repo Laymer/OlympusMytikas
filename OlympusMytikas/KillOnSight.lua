@@ -789,7 +789,7 @@ function Board.LogPrint()
 	Say("|cffffd100audit log|r - newest first (shared with GM and " .. Board.MANAGER_RANK .. " only):")
 	for i = 1, math.min(#audit, 15) do
 		local r = audit[i]
-		local ok, when = pcall(os.date, "!%Y-%m-%d %H:%M", tonumber(r.at) or 0)
+		local ok, when = pcall(date, "!%Y-%m-%d %H:%M", tonumber(r.at) or 0)
 		if not ok then when = tostring(r.at) end
 		Say("%s  %s %s %s%s", tostring(when), r.who, Board.AUDIT_LABELS[r.action] or r.action,
 			r.target, r.detail ~= "" and (" - " .. r.detail) or "")

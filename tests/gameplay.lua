@@ -371,6 +371,9 @@ local function board()
     command("remove") -- An omitted name deliberately selects the highlighted row.
     assert(entries["n:fixturerival"] == nil and ns.ui.selected == nil)
     assert(ns.Store().removed[target.guid] and #ns.Store().audit == 1)
+    env.os, env.date = false, os.date
+    command("log")
+    assert(messages[#messages]:find(os.date("!%Y-%m-%d %H:%M", 1800000000), 1, true))
     player.faction = "Horde"
     assert(next(ns.Store().entries) == nil)
     player.faction = "Alliance"
