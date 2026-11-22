@@ -1,0 +1,81 @@
+name: Publish to CurseForge
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable GitHub release (for example, v1.0.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+concurrency:
+  group: curseforge-${{ inputs.tag || github.event.release.tag_name }}
+  cancel-in-progress: false
+env:
+  TAG: ${{ inputs.tag || github.event.release.tag_name }}
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  check:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'release' && !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v'))
+    runs-on: ubuntu-24.04
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Validate stable tag
+        run: |
+          [[ "$TAG" =~ ^v(0|[1-9][0-9]{0,7})\.(0|[1-9][0-9]{0,7})\.(0|[1-9][0-9]{0,7})$ ]]
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: refs/tags/${{ env.TAG }}
+          persist-credentials: false
+      - name: Identify tagged commit
+        id: source
+        run: echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Run tagged addon checks
+        run: |
+          sudo apt-get update && sudo apt-get install -y lua5.1
+          luac5.1 -p OlympusMytikas/*.lua OlympusMytikas/libs/*.lua
+          # The original v1.0.1 release predates the Lua test suites.
+          if [[ "$TAG" != v1.0.1 ]]; then
+            lua5.1 tests/shared-window.lua
+            lua5.1 tests/gameplay.lua
+          fi
+
+  publish:
+    needs: check
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Confirm tested tag
+        env:
+          TESTED_COMMIT: ${{ needs.check.outputs.commit }}
+        run: test "$(git rev-parse "refs/tags/${TAG}^{commit}")" = "$TESTED_COMMIT"
+      - name: Prepare installable GitHub release ZIP
+        id: package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXISTING_ONLY: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          options=()
+          if [[ "$EXISTING_ONLY" == true ]]; then options+=(--existing-only); fi
+          python3 scripts/prepare_release.py "$TAG" "$(mktemp -d)" "${options[@]}"
+      - name: Submit GitHub asset to CurseForge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_API_TOKEN }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: python3 scripts/publish_curseforge.py "$TAG" "$ARCHIVE"
