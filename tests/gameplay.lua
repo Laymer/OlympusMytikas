@@ -124,6 +124,24 @@ local function recruit()
     event("PLAYER_ENTERING_WORLD")
     assert(#sends == 2, "Events and timers should not send additional posts")
 
+    local function echo(sender, channel)
+        event("CHAT_MSG_CHANNEL", stored.custom[2], sender, nil, nil, nil, nil, nil, channel)
+    end
+    command("pick " .. index)
+    echo("Other", 1)
+    echo("Beta-Elsewhere", 2)
+    echo("Beta-Fixture", 3)
+    timers[#timers]()
+    assert(messages[#messages - 1]:find("no echo", 1, true))
+    echo("Beta-Fixture", 1)
+    echo("Beta", 1)
+    timers[#timers]()
+    assert(messages[#messages - 1]:find("only one echo", 1, true))
+    echo("Beta", 2)
+    local before = #messages
+    timers[#timers]()
+    assert(#messages == before)
+
     local nextEnv, reload = client(player, {recruit = stored})
     reload("OlympusRecruit")
     local nextCommand = nextEnv.SlashCmdList.OLYMPUSRECRUIT
