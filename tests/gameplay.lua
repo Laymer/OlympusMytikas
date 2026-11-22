@@ -248,10 +248,14 @@ local function largeDigest()
     local receiver = receiverLoad("KillOnSight")
     receiverEnv.IsInGuild = function() return true end
     env.IsInGuild = function() return true end
+    -- The 1.0.1 receiver expires a set 30 seconds after its first frame.
+    local elapsed = 0
+    receiverEnv.GetTime = function() return elapsed end
     local bytes, sets = 0, {}
     env.SendAddonMessage = function(prefix, frame, channel)
         local id, count = frame:match("^C(%d+):%d+:(%d+):")
         if id then sets[id] = tonumber(count) end
+        elapsed = elapsed + 1.2 -- One pump per SEND_INTERVAL in the game.
         bytes = bytes + #frame
         receiver.OnAddonMessage(prefix, frame, channel, "Alpha")
     end
