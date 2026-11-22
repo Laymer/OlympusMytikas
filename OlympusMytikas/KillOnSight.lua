@@ -1576,7 +1576,8 @@ local function SendDigest(urgent)
 	if #rows == 0 then return false end
 	local batch, bytes = {}, 0
 	for _, row in ipairs(rows) do
-		if bytes + #row + 1 > MAX_PARTS * CHUNK then
+		-- Keep a set below the 1.0.1 peer timeout (30s at 1.2s per frame).
+		if bytes + #row + 1 > 20 * CHUNK then
 			QueueParts(table.concat(batch, ";"), urgent)
 			batch, bytes = {}, 0
 		end
