@@ -1,3 +1,7 @@
+Olympus Mytikas 1.0.3 for WoW Forever 1.60.1
+
+The addon now displays version 1.0.3. Gameplay and settings are identical to 1.0.2.
+
 Olympus Mytikas 1.0.2 for WoW Forever 1.60.1
 
 - Monthly hunter prizes use UTC month boundaries. Dated credits saved under “unknown” are recovered before rollover, and officers can record the archived prize after a reload. Officer audit timestamps now display in Forever. [#5](https://github.com/Mytikas-Monster/OlympusMytikas/pull/5) [#15](https://github.com/Mytikas-Monster/OlympusMytikas/pull/15)
