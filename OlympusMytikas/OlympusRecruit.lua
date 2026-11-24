@@ -1148,16 +1148,13 @@ end)
 frame:SetScript("OnEvent", function(_, event, ...)
 	if event == "ADDON_ACTION_BLOCKED" or event == "ADDON_ACTION_FORBIDDEN" then
 		local addon, fn = ...
-		lastBlock = tostring(fn or "?") .. " (" .. tostring(addon or "?") .. ")"
 		local who = tostring(addon or "?")
-		if not blockSaid[who] then
-			blockSaid[who] = true
-			if addon == "OlympusRecruit" or addon == "OlympusMytikas" then
+		if addon == "OlympusRecruit" or addon == "OlympusMytikas" then
+			lastBlock = tostring(fn or "?") .. " (" .. who .. ")"
+			if not blockSaid[who] then
+				blockSaid[who] = true
 				Say("the client blocked " .. lastBlock .. " - that is the 'Interface action failed' line")
 				Say("this client only allows a channel post inside a real click or key press")
-			else
-				Say("the client blocked " .. lastBlock .. " - that is NOT this addon")
-				Say("something else is doing it")
 			end
 		end
 		return
@@ -1208,6 +1205,7 @@ local function Help()
 	Say("/om why - what the client last blocked")
 	Say("/om minimap - minimap button on/off")
 	Say("/om profile - which character the settings belong to")
+	Say("/om version - build-check notice on/off")
 	Say("right-click a player's portrait or a name in chat: Invite to <guild>")
 	Say("1.60.1 forbids addon guild invites: that line copies /ginvite for you to press")
 	Say("posts always go to /1 and /2 - no channel is joined, left or moved")
@@ -1217,6 +1215,14 @@ local function Handle(msg)
 	msg = tostring(msg or ""):gsub("^%s+", ""):gsub("%s+$", "")
 	local cmd, rest = msg:match("^(%S*)%s*(.-)$")
 	cmd = string.lower(cmd or "")
+	if OlympusMytikasLoaded and (cmd == "version" or cmd == "ver") then
+		if type(OlympusMytikasVersion) == "table" and type(OlympusMytikasVersion.command) == "function" then
+			OlympusMytikasVersion.command(rest)
+		else
+			Say("no build check in this addon")
+		end
+		return
+	end
 	local db = EnsureDB()
 
 	if cmd == "" or cmd == "post" then
@@ -1343,6 +1349,6 @@ SLASH_OLYMPUSRECRUIT1 = "/om"
 SLASH_OLYMPUSRECRUIT2 = "/olympus"
 
 -- keybind labels
-_G["BINDING_HEADER_OLYMPUSRECRUIT"] = "Olympus Recruit"
+_G["BINDING_HEADER_OLYMPUSRECRUIT"] = "Olympus Mytikas"
 _G["BINDING_NAME_OLYMPUSRECRUIT_POST"] = "Post a recruitment ad"
 _G["BINDING_NAME_OLYMPUSRECRUIT_UI"] = "Open the Olympus Recruit window"
