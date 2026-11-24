@@ -1,3 +1,33 @@
+Olympus Mytikas — 1.1.2
+
+1.1.2 — fixes for WoW Forever
+The shared window shows your installed version and a selectable Member Home address alongside the KoS toggle.
+Forever map pins use the correct map coordinates. Recruit keeps saved profiles, fits its ads in the chat limit, and checks for your own message in each channel.
+The debt Ledger follows the current bounty on each target. Deleting or resetting targets removes their Ledger rows. Starting a new bounty on a settled target replaces its previous Ledger row.
+Guildmates can sync large boards and offscreen targets. The monthly prize rolls over in UTC and saved payouts survive a board reset.
+
+Also included from the 1g update
+
+1.1.0 — major update: live 1g bounties
+Live bounties: right-click, /kos bounty, /kos fund or Fund puts up 1g at once; requester owes until GM/Valar runs /kos paidup <name>. /kos owed, Ledger and Officers show it.
+Every bounty shows the killer's level and the layer he was on (layer S, layer P) on the board row, detail panel, Announce and /kos where. Read from LayerSwap and visible creatures, never guessed.
+70/30 stays: bank keeps 30%, hunter's 70% joins the month's one prize pool, top hunter wins, a person pays, /kos boardpaid records it. Addon never moves gold.
+
+1.1.1 — small follow-up
+New Ledger tab: who owes what, plus cleared debts with date and who cleared them.
+Fixes in this build: no mouse-wheel scrolling (use Prev/Next), board and Ledger rows stay still during sync, old 3g rows cannot reset 1g, plain words: bank keeps, prize paid out, prize pool, refunded.
+Layers show only on NEW kills and retire after one hour; unknown stays unknown, your own layer is read only at a real death. Announce reads latest level/layer first.
+Swap to layer opens a plain RP whisper to the victim who set the bounty; press Enter. Hidden LayerSwap notes still let hosts auto-invite.
+Only the guild master or Valar can delete; deletes stay final on old and new clients. Re-add by hand (/kos add).
+Kill/death notices no longer spam chat - /kos chat replays them, /kos chat clear wipes them.
+The window has a KoS ON/OFF button; /kos off|on does the same. Off stops notices, sync, badges and pins.
+All Olympus-family local chat is hidden to cut spam; /mytikas hidden replays it. Replies to commands you type still show.
+First-run notice covers all of the above in 7 steps.
+1.1.1 added the quiet version check; /om version checks or toggles it.
+
+Still true: no auto-post, no addon invites, no SetRaidTarget / Skull button / RAID_WARNING chat.
+Install: use only OlympusMytikas; keep old folders as backup. Built from Recruit 1.6.5 + KoS 1.5.4.
+
 Olympus Mytikas 1.0.3 for WoW Forever 1.60.1
 
 The addon now displays version 1.0.3. Gameplay and settings are identical to 1.0.2.
