@@ -1,42 +1,23 @@
-Olympus Mytikas 1.0.3 for WoW Forever 1.60.1
+Olympus Mytikas — 1.1.1
 
-The addon now displays version 1.0.3. Gameplay and settings are identical to 1.0.2.
+Since the 1g update
 
-Olympus Mytikas 1.0.2 for WoW Forever 1.60.1
+1.1.0 — major update: live 1g bounties
+Live bounties: right-click, /kos bounty, /kos fund or Fund puts up 1g at once; requester owes until GM/Valar runs /kos paidup <name>. /kos owed, Ledger and Officers show it.
+Every bounty shows the killer's level and the layer he was on (layer S, layer P) on the board row, detail panel, Announce and /kos where. Read from LayerSwap and visible creatures, never guessed.
+70/30 stays: bank keeps 30%, hunter's 70% joins the month's one prize pool, top hunter wins, a person pays, /kos boardpaid records it. Addon never moves gold.
 
-- Monthly hunter prizes use UTC month boundaries. Dated credits saved under “unknown” are recovered before rollover, and officers can record the archived prize after a reload. Officer audit timestamps now display in Forever. [#5](https://github.com/Mytikas-Monster/OlympusMytikas/pull/5) [#15](https://github.com/Mytikas-Monster/OlympusMytikas/pull/15)
-- Clearing targets with /kos reset preserves hunter credits, prize pools, payments, guild deaths and the audit log. [#4](https://github.com/Mytikas-Monster/OlympusMytikas/pull/4)
-- Partial deposits accumulate across /kos deposited and guild bank updates. Seeing the same balance twice credits it once. [#6](https://github.com/Mytikas-Monster/OlympusMytikas/pull/6)
-- Guildmates can share and remove offscreen targets by name. The board reconciles the name when a player GUID becomes available, and kill credit requires a real player GUID. [#11](https://github.com/Mytikas-Monster/OlympusMytikas/pull/11)
-- Guild sync now delivers messages around the 210-byte boundary intact, separates simultaneous sends from different players and splits large boards at row boundaries so 1.0.1 peers can receive them before their timeout. [#8](https://github.com/Mytikas-Monster/OlympusMytikas/pull/8) [#9](https://github.com/Mytikas-Monster/OlympusMytikas/pull/9) [#13](https://github.com/Mytikas-Monster/OlympusMytikas/pull/13) [#14](https://github.com/Mytikas-Monster/OlympusMytikas/pull/14)
-- Map pins use Forever’s world coordinates. The package includes HereBeDragons 2.18 core and its BSD redistribution notice. [#10](https://github.com/Mytikas-Monster/OlympusMytikas/pull/10)
-- Bounty entry and reward settings accept fractional gold down to one copper and enforce copper bounds. The add dialog preserves fractional defaults, malformed legacy rewards recover safely, and /kos add keeps the reason when gold is omitted. Commands report an unknown named target instead of acting on the selected row. [#2](https://github.com/Mytikas-Monster/OlympusMytikas/pull/2)
-- Recruitment ads 32 and 33 fit the channel limit at their original positions. Delivery checks recognize your own matching post once per intended channel, and posting works when echo timers are unavailable. [#7](https://github.com/Mytikas-Monster/OlympusMytikas/pull/7) [#12](https://github.com/Mytikas-Monster/OlympusMytikas/pull/12) [#2](https://github.com/Mytikas-Monster/OlympusMytikas/pull/2)
-- Custom ad deletion requires a whole-number position, and the length warning counts bytes. Recruit recovers malformed saved profiles and the /om reset notice explains that custom ads are shared account-wide. [#2](https://github.com/Mytikas-Monster/OlympusMytikas/pull/2)
+1.1.1 — small follow-up
+New Ledger tab: who owes what, plus cleared debts with date and who cleared them.
+Fixes in this build: no mouse-wheel scrolling (use Prev/Next), board and Ledger rows stay still during sync, old 3g rows cannot reset 1g, plain words: bank keeps, prize paid out, prize pool, refunded.
+Layers show only on NEW kills and retire after one hour; unknown stays unknown, your own layer is read only at a real death. Announce reads latest level/layer first.
+Swap to layer opens a plain RP whisper to the victim who set the bounty; press Enter. Hidden LayerSwap notes still let hosts auto-invite.
+Only the guild master or Valar can delete; deletes stay final on old and new clients. Re-add by hand (/kos add).
+Kill/death notices no longer spam chat - /kos chat replays them, /kos chat clear wipes them.
+The window has a KoS ON/OFF button; /kos off|on does the same. Off stops notices, sync, badges and pins.
+All Olympus-family local chat is hidden to cut spam; /mytikas hidden replays it. Replies to commands you type still show.
+First-run notice covers all of the above in 7 steps.
+1.1.1 added the quiet version check; /om version checks or toggles it.
 
-Testing, packaging and publishing
-
-- Lua 5.1 checks cover the shared window, installed version, selectable Member Home link, tab switching, saved profiles and gameplay. New regression fixtures exercise UTC rollover, bank accounting, guild sync, recruitment and map coordinates. [#1](https://github.com/Mytikas-Monster/OlympusMytikas/pull/1) [#2](https://github.com/Mytikas-Monster/OlympusMytikas/pull/2)
-- The CurseForge publisher verifies the tagged addon and GitHub ZIP, uploads the same asset and release notes for Forever, and records a receipt to support safe retries. Python tests cover packaging, release preparation and submission. [#3](https://github.com/Mytikas-Monster/OlympusMytikas/pull/3)
-
-[Full comparison from v1.0.1 to v1.0.2](https://github.com/Mytikas-Monster/OlympusMytikas/compare/v1.0.1...v1.0.2)
-
-1.0.1 - Show installed version and a selectable Member Home URL in the shared window.
-
-Olympus Mytikas 1.0.0 - the two addons are now one
-
-Install one folder. Inside it: OlympusRecruit 1.6.5 + KillOnSight 1.5.4 in one shell window with two tabs, one minimap button, their bundled map libraries and the Olympus art.
-
-WHAT'S IN THIS ONE ADDON
-- Files: OlympusMytikas.toc + OlympusMytikas.lua (the shared window, tabs and minimap button), OlympusRecruit.lua, KillOnSight.lua, Bootstrap.lua, libs\ (LibStub, CallbackHandler, HereBeDragons + pins), Media\ (portrait, minimap, panel, glow, bounty, emblem), CHANGELOG.txt.
-- Recruit tab: /om posts one random ad to /1 General and /2 Trade in one pass, 61 ads, custom ads (/om add, /om del), and the right-click "Invite to <guild>" line. Forever forbids addon invites, so it copies /ginvite First Surname for you to paste and press yourself. No auto-post.
-- Kill on Sight tab: shared kill board, death feed with last-known locations, 30-minute map pins, pending bounty jobs, flat 3g bounties verified against the guild bank, 70/30 split, monthly Hunter Board with one pooled prize, first-run rules notice, audit log, Valar/GM-only remove and settle.
-- Shared skin: one window on Forever's own chrome, titled Olympus Mytikas, with the white-mountain-on-navy portrait and matching minimap button (left opens the last tab, right posts an ad, drag saves the angle). KoS keeps its Board / Hunter Board sub-tabs; all /om and /kos commands still work.
-
-NEW IN THE MERGE
-- The Recruit tab's old custom art is gone; both tabs use the kill board's frame and bronze insets.
-- Latest upstream fixes are in: Recruit 1.6.5 dropped the 15 guild-war ads; KoS 1.5.4 fixed the "Valar" rank spelling that locked the rank out of its own board.
-
-STILL TRUE
-Gold never moves by addon: a person deposits at the bank and pays the hunter. A name on the board is not a bounty until the bank balance proves it.
-Delete the old OlympusRecruit and KillOnSight folders after installing. The source addons are left untouched for reference.
+Still true: no auto-post, no addon invites, no SetRaidTarget / Skull button / RAID_WARNING chat.
+Install: use only OlympusMytikas; keep old folders as backup. Built from Recruit 1.6.5 + KoS 1.5.4.

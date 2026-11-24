@@ -1,0 +1,12 @@
+<Bindings>
+	<!-- Do NOT list this file in the .toc: this client loads Bindings.xml from the
+	     addon folder by itself (same as Olympus and Manners, which also omit it).
+	     A literal category makes its own section in Key Bindings; a literal name is
+	     shown as-is, so neither needs a BINDING_HEADER_ / BINDING_NAME_ global. -->
+	<Binding name="Post a recruitment ad" category="Olympus Mytikas">
+		OlympusRecruit_Post()
+	</Binding>
+	<Binding name="Open the Olympus Recruit window" category="Olympus Mytikas">
+		OlympusRecruit_UI()
+	</Binding>
+</Bindings>

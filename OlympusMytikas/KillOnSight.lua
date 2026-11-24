@@ -1,22 +1,19 @@
--- Kill on Sight (KoS) - a guild kill list with escrowed bounties.
+-- Kill on Sight (KoS) - a guild kill list with bounties owed on trust.
 --
 -- THE RULE THIS ADDON ENFORCES
---   A bounty exists only when its money is already in the guild bank. A death puts an enemy on the
---   board as UNFUNDED (name, who he killed, how much a bounty would need). Right-clicking his name
---   starts a PENDING JOB instantly - shared with the guild and visible in the window - but it is
---   still not a bounty and pays nothing. The addon verifies the deposit against the guild bank's own
---   gold (GetGuildBankMoney), not against a promise: the depositor arms the entry, deposits the gross
---   amount, and the bank's gold going up by that much is what makes the job live. The killer is then
---   bank keeps 30%; the hunter's 70% is NOT paid per kill. It goes into ONE prize pool for that
---   month, and the hunter who completed the most funded bounties wins the whole pool.
+--   A bounty is LIVE the moment a member asks for it - no waiting for a bank run. Every bounty is 1g.
+--   The requester owes that 1g to the guild bank; the addon keeps the log of who owes what and a
+--   manager clears it with /kos paidup <name>. On the kill the bank keeps 30% (30s) and the hunter's
+--   70% (70s) joins ONE prize pool for the month; the top hunter wins the whole pool. A human still
+--   pays the prize - the addon never moves gold.
 --
 -- WHAT IT DOES
---   * An enemy player who kills you is added to the guild board automatically (name, class, moment).
+--   * An enemy player who kills you is added to the guild board automatically (name, class, level,
+--     layer, moment) and the death is shared with the guild.
 --   * The board is shared live with every guildmate running the addon over the guild addon channel.
---   * Anyone who kills a funded target gets the claim recorded; the 70% share joins the month's
---     pool and the window shows the current leader. /kos boardpaid records the hand-over.
---   * Right-click a name (or /kos bounty <name>) starts a pending job; only a verified deposit makes
---     it live. Every bounty asks a flat 3g. /kos fund <name> arms it, /kos bank shows the ledger.
+--   * Anyone who kills a live target gets the claim recorded; the 70% share joins the month's pool.
+--   * Right-click a name (or /kos fund <name>) makes the bounty live at once. /kos owed shows both
+--     what members owe the bank and what the bank owes; /kos paidup clears a member's debt.
 --
 -- WHAT THIS CLIENT ALLOWS (verified against Forever 1.60.1, interface 16001)
 --   * The combat-log event is RESTRICTED here: registering it throws "Interface action
@@ -36,12 +33,11 @@
 --     still refuses it the chat box opens with the line ready for one Enter.
 --   * Addon messages ARE allowed from timers: C_ChatInfo.SendAddonMessage(PREFIX, msg, "GUILD"),
 --     255 bytes a part, sender at arg 4 of CHAT_MSG_ADDON. That carries the board.
---   * The guild bank is readable: GetGuildBankMoney(), GetGuildBankWithdrawMoney(), the events
---     GUILDBANKFRAME_OPENED and GUILDBANK_UPDATE_MONEY (Olympus\Bank.lua reads the same). An addon
---     can never MOVE gold - a deposit or a withdrawal needs the bank frame and a real click - so the
---     addon verifies and records; a human still moves the money.
---   * Verification needs a readable balance. If the client cannot read the bank's gold, no bounty is
---     issued at all, and /kos status says so.
+--   * The guild bank is readable, but a bounty no longer waits for a deposit: bounties run on trust
+--     and the addon only records who owes what. An addon can never MOVE gold - a deposit or a
+--     withdrawal needs the bank frame and a real click - so a human still moves the money.
+--   * There is no layer API. Like LayerSwap, the layer is read from a nearby creature's GUID
+--     (Creature-0-<server>-<map>-...); the numeric <server> part identifies the layer on Forever.
 --
 -- Identity: a listed player is his GUID ("Player-<server>-<hex>"); the name is only a label. A kill
 -- counts only when the killing blow is a real hostile player: the event ends in _DAMAGE, sourceFlags
@@ -55,11 +51,21 @@ local ADDON, ns = ...
 ns.PREFIX = "KOS"
 ns.VERSION = "1.5.4"
 
+-- Kill/death notices are kept here instead of sprayed into chat. /kos chat replays them.
+ns.chatLog = {}
+ns.CHAT_LOG_MAX = 50
+
+-- The merged Olympus Mytikas window owns the on/off switch. Running this addon on its
+-- own always leaves it enabled. One function is used by every event, ticker and command.
+ns.Enabled = function()
+	if OlympusMytikasLoaded then return OlympusMytikasDB.kosEnabled ~= false end
+	return true
+end
+
 local PREFIX = ns.PREFIX
 local DEATH_WINDOW = 5
 local MSG_MAX = 250
 local CHUNK = 210
-local MAX_PARTS = 40
 local SEND_INTERVAL = 1.2
 local RETRY_WAIT = { 2, 4, 8, 15, 30 }
 local HELLO_EVERY = 600
@@ -70,13 +76,14 @@ local MAX_CLAIMS = 6
 local MAX_QUEUE = 300
 local MAX_NAME = 40
 local MAX_REASON = 70
-local DEFAULT_REWARD = 30000        -- copper: 3g, what every bounty asks for
+local DEFAULT_REWARD = 10000        -- copper: 1g, what every bounty asks for
 local DEFAULT_CUT = 30              -- percent the bank keeps from a bounty (the other 70% is pooled)
 local REFUND_DAYS = 7               -- an unclaimed bounty goes back to its payer after this long
 local OFFICER_REMIND = 900          -- seconds between "the bank still owes" reminders in chat
 local OFFICER_LIST = 3              -- payments named in one officer-chat line before "+N more"
 local SPOT_GRID = 1000              -- a last-known map point is shared in tenths of a percent
 local PIN_TTL = 1800                -- map pins retire 30 minutes after the last sighting
+local LAYER_TTL = 3600              -- a layer reading is only true for this long; then it is unknown
 
 -- One table holds the map helpers and the map-pin state. Lua 5.1 gives the main chunk only 200
 -- local slots; separate locals for every helper pushed this file past that ceiling.
@@ -148,8 +155,8 @@ end
 -- ends even when a PC clock is wrong. A guarded fallback keeps an odd client from breaking onboard.
 function Board.BoardMonth(at)
 	at = math.floor(tonumber(at) or 0)
-	if at > 0 and type(date) == "function" then
-		local ok, value = pcall(date, "!%Y-%m", at)
+	if at > 0 and type(os) == "table" and type(os.date) == "function" then
+		local ok, value = pcall(os.date, "!%Y-%m", at)
 		if ok and type(value) == "string" and value:match("^%d%d%d%d%-%d%d$") then return value end
 	end
 	return "unknown"
@@ -198,11 +205,22 @@ local function ClassColor(entry)
 	return "|cff" .. hex
 end
 
-local function Say(fmt, ...)
-	local text = select("#", ...) > 0 and fmt:format(...) or fmt
+local function RawSay(text)
 	if type(DEFAULT_CHAT_FRAME) == "table" and DEFAULT_CHAT_FRAME.AddMessage then
 		DEFAULT_CHAT_FRAME:AddMessage("|cffbe5720[KoS]|r " .. text)
 	end
+end
+
+local function Say(fmt, ...)
+	local text = select("#", ...) > 0 and fmt:format(...) or fmt
+	RawSay(text)
+end
+
+-- A death or bounty notice is history, not a command reply: store it and stay quiet.
+local function Notice(fmt, ...)
+	local text = select("#", ...) > 0 and fmt:format(...) or fmt
+	ns.chatLog[#ns.chatLog + 1] = text
+	if #ns.chatLog > ns.CHAT_LOG_MAX then table.remove(ns.chatLog, 1) end
 end
 
 local function Realm()
@@ -292,7 +310,6 @@ end
 -- Only the guild master and the Valar rank may remove rows or clear what the bank owes. Everybody
 -- else can still add a name, fund a bounty, announce it and read the board. These live on Board
 -- rather than as more top-level locals (Lua 5.1's main chunk is at its 200-local ceiling).
-Board.MAX_COPPER = 100000000
 Board.MANAGER_RANK = "Valar"
 Board.DENIED = "only the guild master or " .. Board.MANAGER_RANK ..
 	" can remove entries or clear what the bank owes"
@@ -343,6 +360,7 @@ local DEFAULTS = {
 	ignoreInstances = true,
 	share = true,
 	notices = true,
+	warnNearby = true,
 	minimap = true,
 	minimapAngle = 210,
 }
@@ -353,6 +371,9 @@ local function Init()
 	for k, v in pairs(DEFAULTS) do
 		if db[k] == nil then db[k] = v end
 	end
+	-- The old saved toggle is gone. The guild master and Valar are the only board authorities;
+	-- keeping a stale flag would only make an old profile look like it still does something.
+	db.master = nil
 	-- One-time move to the new terms: a 30% bank cut and a 3g ask. Deliberately custom values
 	-- (anything other than the old defaults) are left alone. The v147 flag puts back a profile
 	-- that briefly saw the discarded 40% cut.
@@ -367,19 +388,47 @@ local function Init()
 	end
 	if type(db.scopes) ~= "table" then db.scopes = {} end
 	if type(db.bank) ~= "table" then db.bank = {} end
+	-- 1.2.0: flat 1g bounties, live on request. Old 3g asks move to 1g; a previously pending job
+	-- keeps its name on the board but is no longer a half-state, and any live bounty now records a
+	-- debt owed by the requester until a manager marks it paid.
+	if not db.v120Migrated then
+		if tonumber(db.defaultReward) == 30000 then db.defaultReward = 10000 end
+		for _, scope in pairs(db.scopes) do
+			for _, e in pairs(type(scope) == "table" and scope.entries or {}) do
+				e.job = nil
+				if not e.paid and not e.refunded then
+					e.want = DEFAULT_REWARD
+					if (tonumber(e.funded) or 0) > 0 then
+						e.funded = DEFAULT_REWARD
+						e.paidUp = false
+					end
+				end
+			end
+		end
+		db.v120Migrated = true
+	end
 	-- One-time move to a flat ask: every bounty is 3g, with no +5g for further kills.
 	if not db.v146Migrated then
 		db.killBonus = 0 -- left in old profiles only; never read again
 		local ask = tonumber(db.defaultReward) or DEFAULT_REWARD
 		for _, scope in pairs(db.scopes) do
-			local entries = type(scope) == "table" and scope.entries
-			for _, e in pairs(type(entries) == "table" and entries or {}) do
-				if type(e) == "table" and (tonumber(e.kills) or 0) > 1 and not e.paid and not e.refunded then
+			for _, e in pairs(type(scope) == "table" and scope.entries or {}) do
+				if (tonumber(e.kills) or 0) > 1 and not e.paid and not e.refunded then
 					e.want = math.max(ask, tonumber(e.funded) or 0)
 				end
 			end
 		end
 		db.v146Migrated = true
+	end
+	-- An old guildmate can replay a row with a 3g ask long after the one-time migration has run.
+	-- Keep the flat 1g rule on EVERY load, so a stale synced row can never put the old price back.
+	for _, scope in pairs(db.scopes) do
+		for _, e in pairs(type(scope) == "table" and scope.entries or {}) do
+			if (tonumber(e.want) or 0) > DEFAULT_REWARD then e.want = DEFAULT_REWARD end
+			if (tonumber(e.funded) or 0) > DEFAULT_REWARD and not e.paid and not e.refunded then
+				e.funded = DEFAULT_REWARD
+			end
+		end
 	end
 	clock = tonumber(db.clock) or 0
 	return db
@@ -388,6 +437,21 @@ end
 local function DB()
 	if not db then Init() end
 	return db
+end
+
+-- Defined here, after DB and MapLib exist, so the shell's button can stop every
+-- part of KoS without the addon throwing on a not-yet-declared helper.
+ns.SetEnabled = function(on)
+	on = on and true or false
+	if OlympusMytikasLoaded then
+		OlympusMytikasDB.kosEnabled = on
+	else
+		DB().kosEnabled = on
+	end
+	ns.warned = {}
+	MapLib.pinDirty = true
+	if not on then pcall(MapLib.Release, nil) end
+	return on
 end
 
 local function Store()
@@ -419,6 +483,9 @@ local function Bump(entry)
 	entry.stamp = clock
 	DB().clock = clock
 	MapLib.pinDirty = true
+	-- A funding, removal or sync can change "is this nearby player wanted?" without any
+	-- nameplate event firing. Reconcile now instead of waiting up to half a second.
+	if ns.RefreshMarks then pcall(ns.RefreshMarks) end
 end
 
 local function Observe(stamp)
@@ -468,6 +535,10 @@ local function Trim()
 		end
 	end
 	if count > MAX_ENTRIES and oldest then
+		-- Keep the prune tombstone ahead of the row's own birth stamp, or an old copy could
+		-- walk straight back onto the board.
+		clock = clock + 1
+		DB().clock = clock
 		s.removed[oldest] = clock
 		s.entries[oldest] = nil
 	end
@@ -509,40 +580,34 @@ local function RefundDue(e)
 	return at + days * 86400
 end
 
--- pending job / partly funded / live / claimed / paid / refund due / refunded / unfunded
--- A pending job is one somebody has explicitly started (right-click) but whose gold is not in the
--- guild bank yet. It is a job on the board, never a payable bounty: only a verified deposit moves
--- it to live. A death that nobody started a job for stays plain "unfunded".
+-- live / claimed / paid / refund due / refunded / unfunded. There is no pending half-state any
+-- more: a request makes the bounty live at once, and a plain death with no request stays unfunded.
 local function StateOf(e)
 	if not e then return "unfunded" end
 	if e.paid then return "paid" end
 	if e.refunded then return "refunded" end
 	if e.refundDue then return "refunddue" end
 	local funded = tonumber(e.funded) or 0
-	local want = tonumber(e.want) or 0
-	if e.job and funded < want then return "pending" end
 	if funded <= 0 then return "unfunded" end
 	if e.claims and #e.claims > 0 then return "claimed" end
-	if funded < want then return "partly" end
 	return "live"
 end
 
 local function StateText(e)
 	local state = StateOf(e)
-	if state == "pending" then return "pending job" end
 	if state == "paid" then return "in prize pool" end
 	if state == "refunded" then return "handed back" end
 	if state == "refunddue" then return "refund due" end
 	if state == "claimed" then return "claimed" end
 	if state == "live" then return "bounty" end
-	if state == "partly" then return "part funded" end
 	return "no bounty"
 end
 
 -- ============================================================================ wire format
 
--- E rows carry the money as it is, never as a promise: an entry with funded = 0 reaches every other
--- client as an unfunded row, so nobody can see a payable bounty that was not verified somewhere.
+-- E rows carry the money and the trust state as they are: funded > 0 means a member asked for a live
+-- bounty, and field 23 says whether a manager has cleared that member's debt. A plain name (funded =
+-- 0) reaches every client as a name only, so nobody can see a payable bounty that was not requested.
 local function RowFor(e, quiet)
 	local victims, claims = {}, {}
 	for i = 1, #e.victims do victims[i] = Clean(e.victims[i], 24) end
@@ -563,13 +628,29 @@ local function RowFor(e, quiet)
 		Clean(e.paidTo, 24) or "", tostring(math.floor(tonumber(e.paidAt) or 0)),
 		Clean(e.refundedTo, 24) or "", tostring(math.floor(tonumber(e.refundedAt) or 0)),
 		tostring(math.floor(tonumber(e.refundDays) or (DB().refundDays or 0))),
-		e.job and "1" or "0",
+		e.paidUp and "1" or "0",
 		-- last known spot: map, tenths of a percent x/y, when, exact or nearby
 		e.spot and tostring(math.floor(tonumber(e.spot.map) or 0)) or "0",
 		e.spot and tostring(math.floor(tonumber(e.spot.x) or 0)) or "0",
 		e.spot and tostring(math.floor(tonumber(e.spot.y) or 0)) or "0",
 		e.spot and tostring(math.floor(tonumber(e.spot.at) or 0)) or "0",
 		e.spot and e.spot.kind == "nearby" and "n" or (e.spot and "e" or "0"),
+		-- 1.1.1: level and LayerSwap's letter for the layer, read at the death
+		tostring(math.floor(tonumber(e.klevel) or 0)),
+		-- An expired layer is not sent at all: old clients have no TTL and would show it forever.
+		ns.LayerFresh(e) and ns.LayerWire(e.klayer) or "",
+		-- 1.2.2: when and by whom a member's debt was marked paid up, for the ledger history
+		tostring(math.floor(tonumber(e.clearedAt) or 0)),
+		Clean(e.clearedBy, 24) or "",
+		-- 1.2.2: a fresh add carries its own birth stamp. A deletion outranks every old copy of
+		-- a row, so only this mark can bring a deleted name back.
+		tostring(math.floor(tonumber(e.reborn) or 0)),
+		-- field 34: when the layer letter was read. After an hour it is no longer shown.
+		tostring(math.floor(tonumber(e.klayerAt) or 0)),
+		-- field 35: only a kill captured at death gets a layer. Old kills never carry one.
+		e.layerNew and "1" or "0",
+		-- field 36: the time of the last kill. The board sorts by this, not by when a sync arrived.
+		tostring(math.floor(tonumber(e.killAt) or tonumber(e.at) or 0)),
 	}, "~")
 end
 
@@ -580,26 +661,20 @@ local function Fields(row)
 	return out
 end
 
-function Board.TargetID(value)
-	if type(value) == "string" and value:sub(1, 2) == "n:" then
-		local name = value:sub(3)
-		if name ~= "" and name == Clean(name, MAX_NAME):lower() then return value end
-	end
-	return Guid(value)
-end
-
 local function ParseEntry(row)
 	local f = Fields(row)
 	if f[1] ~= "E" then return nil end
-	local guid = Board.TargetID(f[2])
-	if not guid or (guid:sub(1, 2) == "n:" and guid ~= "n:" .. Clean(f[9], MAX_NAME):lower()) then return nil end
+	local guid = Guid(f[2])
+	if not guid then return nil end
 	local stamp = Num(f[3], 0, 4294967295)
 	if not stamp then return nil end
 	local e = {
 		guid = guid,
 		stamp = stamp,
-		want = Num(f[4], 0, Board.MAX_COPPER) or 0,
-		funded = Num(f[5], 0, Board.MAX_COPPER) or 0,
+		-- Field 4 is kept on the wire for older clients, but this build asks a flat 1g: never let a
+		-- replayed 3g row set the price, and never let an old 3g deposit show as a 3g live bounty.
+		want = DEFAULT_REWARD,
+		funded = math.min(Num(f[5], 0, 100000000) or 0, DEFAULT_REWARD),
 		kills = Num(f[6], 0, 9999) or 0,
 		paid = f[7] == "1",
 		refunded = f[7] == "2",
@@ -619,7 +694,17 @@ local function ParseEntry(row)
 		refundedTo = Clean(f[20], 24),
 		refundedAt = Num(f[21], 0, 4294967295) or 0,
 		refundDays = Num(f[22], 0, 365) or 0,
-		job = f[23] == "1",
+		paidUp = f[23] == "1",
+		clearedAt = Num(f[31], 0, 4294967295) or 0,
+		clearedBy = Clean(f[32], 24) or "",
+		reborn = Num(f[33], 0, 4294967295) or 0,
+		-- Old rows have no stamp; their add time is the best expiry clue we have.
+		klayerAt = Num(f[34], 0, 4294967295) or 0,
+		-- An old client sends no field 35, so its saved kills stay layerless here too.
+		layerNew = f[35] == "1",
+		klevel = Num(f[29], 1, 100) or 0,
+		klayer = ns.LayerValue(f[30]),
+		killAt = Num(f[36], 0, 4294967295) or 0,
 		at = 0,
 		auto = false,
 	}
@@ -629,8 +714,8 @@ local function ParseEntry(row)
 		e.spot = { map = smap, x = sx, y = sy, at = sat,
 			kind = skind == "n" and "nearby" or "exact" }
 	end
+	e.at = e.killAt
 	if e.name == "" then e.name = NameFromGUID(guid) or "Unknown" end
-	if e.funded > e.want then e.want = e.funded end
 	for victim in (f[12] or ""):gmatch("[^,]+") do
 		local v = Clean(victim, 24)
 		if v ~= "" then AddUnique(e.victims, v, MAX_VICTIMS) end
@@ -652,7 +737,6 @@ local backoff, backoffAt, warned = 0, 0, false
 local chunkID = 0
 local pendingAnnounce
 local pendingOfficer
-local armed
 -- Declared here, built with the window further down: every board change redraws it, and a call
 -- that resolves to a global would fail silently on the client.
 local RefreshIfShown
@@ -674,14 +758,19 @@ end
 local function QueueParts(payload, urgent)
 	-- One payload is one chunk set: every part must carry the SAME id or the receiver files each part
 	-- under its own set and never assembles any of them.
-	if #payload <= MSG_MAX then
-		queue[#queue + 1] = payload
-	else
+	local cid
+	if #payload > MSG_MAX then
 		chunkID = (chunkID + 1) % 1000
-		local count = math.ceil(#payload / CHUNK)
-		for index = 1, count do
-			local body = payload:sub((index - 1) * CHUNK + 1, index * CHUNK)
-			queue[#queue + 1] = ("C%d:%d:%d:%s"):format(chunkID, index, count, body)
+		cid = chunkID
+	end
+	for i = 1, #payload, CHUNK do
+		local body = payload:sub(i, i + CHUNK - 1)
+		if not cid then
+			queue[#queue + 1] = body
+		else
+			local count = math.ceil(#payload / CHUNK)
+			local index = math.floor(i / CHUNK) + 1
+			queue[#queue + 1] = ("C%d:%d:%d:%s"):format(cid, index, count, body)
 		end
 	end
 	while #queue > MAX_QUEUE do table.remove(queue, 1) end
@@ -783,13 +872,13 @@ end
 function Board.LogPrint()
 	local audit = Store().audit or {}
 	if #audit == 0 then
-		Say("no audit entries yet - removals, refund decisions, hand-backs and prize payments are recorded here.")
+		Say("no log entries yet - removals, refunds and prize hand-overs are recorded here.")
 		return
 	end
 	Say("|cffffd100audit log|r - newest first (shared with GM and " .. Board.MANAGER_RANK .. " only):")
 	for i = 1, math.min(#audit, 15) do
 		local r = audit[i]
-		local ok, when = pcall(date, "!%Y-%m-%d %H:%M", tonumber(r.at) or 0)
+		local ok, when = pcall(os.date, "!%Y-%m-%d %H:%M", tonumber(r.at) or 0)
 		if not ok then when = tostring(r.at) end
 		Say("%s  %s %s %s%s", tostring(when), r.who, Board.AUDIT_LABELS[r.action] or r.action,
 			r.target, r.detail ~= "" and (" - " .. r.detail) or "")
@@ -810,11 +899,11 @@ local function DeathKey(d)
 	return ("%d|%s|%s"):format(math.floor(tonumber(d.at) or 0), d.kguid or "", d.vname or "")
 end
 
--- D~at~kguid~kclass~kname~vname~vguid~map~x~y~at~kind: the death and the spot where it happened.
--- A shared death must carry its own location: a guildmate may never receive the board row (the
--- killer was deleted, or an older row won), and the feed must still say where that member died.
--- Every field is re-checked on the way in by ParseDeath, so no field is trusted from the wire.
--- Old seven-field rows are still valid and simply have no spot.
+-- D~at~kguid~kclass~kname~vname~vguid~map~x~y~at~kind~klevel~klayer: the death, the spot where it
+-- happened and what could be read of the killer. A shared death must carry its own location and
+-- killer details: a guildmate may never receive the board row (the killer was deleted, or an older
+-- row won), and the feed must still say where that member died. Every field is re-checked on the way
+-- in by ParseDeath, so no field is trusted from the wire. Old rows with fewer fields still parse.
 local function DeathRow(d)
 	local s = d and d.spot
 	local map = s and Num(s.map, 1, 9999999) or 0
@@ -825,11 +914,15 @@ local function DeathRow(d)
 	if map == 0 or (x == 0 and y == 0) or sat == 0 or kind == "0" then
 		map, x, y, sat, kind = 0, 0, 0, 0, "0"
 	end
-	return ("D~%d~%s~%s~%s~%s~%s~%d~%d~%d~%d~%s"):format(
+	return ("D~%d~%s~%s~%s~%s~%s~%d~%d~%d~%d~%s~%d~%s~%d~%s"):format(
 		math.floor(tonumber(d.at) or 0), d.kguid or "",
 		Clean(d.kclass or "", 16), Clean(d.kname or "", MAX_NAME),
 		Clean(d.vname or "", MAX_NAME), d.vguid or "",
-		map, x, y, sat, kind)
+		map, x, y, sat, kind,
+		math.floor(tonumber(d.klevel) or 0),
+		ns.LayerFresh(d) and ns.LayerWire(d.klayer) or "",
+		ns.LayerFresh(d) and math.floor(tonumber(d.klayerAt) or (tonumber(d.at) or 0)) or 0,
+		d.layerNew and "1" or "0")
 end
 
 local function ParseDeath(row)
@@ -851,6 +944,11 @@ local function ParseDeath(row)
 		at = at, kguid = kguid, kclass = ClassCode(Clean(f[4], 16)),
 		kname = kname, vname = Clean(f[6], MAX_NAME), vguid = Guid(f[7]) or "",
 		spot = spot,
+		klevel = Num(f[13], 1, 100) or 0,
+		klayer = ns.LayerValue(f[14]),
+		-- Old rows fall back to the death time, so they retire an hour after the death.
+		klayerAt = Num(f[15], 0, 4294967295) or 0,
+		layerNew = f[16] == "1",
 	}
 end
 
@@ -883,7 +981,7 @@ end
 -- Recorded on the victim's own client, because that is the only place a death is visible, then
 -- shared like a board row. The time is server seconds, so "2h ago" reads the same everywhere.
 -- The spot from CaptureSpot travels with it; only its five wire fields are kept (no unit token).
-local function RecordDeath(kguid, kname, kclass, vname, vguid, spot)
+local function RecordDeath(kguid, kname, kclass, vname, vguid, spot, klevel, klayer)
 	local s = spot and {
 		map = Num(spot.map, 1, 9999999), x = Num(spot.x, 0, SPOT_GRID),
 		y = Num(spot.y, 0, SPOT_GRID), at = Num(spot.at, 1, 4294967295),
@@ -899,8 +997,14 @@ local function RecordDeath(kguid, kname, kclass, vname, vguid, spot)
 		vname = Clean(vname or "", MAX_NAME),
 		vguid = Guid(vguid) or "",
 		spot = s,
+		klevel = Num(klevel, 1, 100) or 0,
+		klayer = ns.LayerValue(klayer),
+		klayerAt = ns.LayerPart(klayer) and Clock() or 0,
+		-- Every death captured by this build is a new kill, even when no layer could be read yet.
+		layerNew = true,
 	}
 	if not d.kguid or d.kname == "" or d.at <= 0 then return nil end
+	ns.RememberKillerInfo(d.kguid, d.klevel, d.klayer, d.klayerAt, d.layerNew)
 	if not StoreDeath(d) then return nil end
 	if CanSend() then QueueParts(DeathRow(d), false) end
 	RefreshIfShown()
@@ -970,7 +1074,7 @@ function Board.ParseBoardRow(row)
 	if f[2] ~= "C" then return nil end
 	local who = Clean(f[3], MAX_NAME)
 	local target = Guid(f[4])
-	local amount = Num(f[6], 1, Board.MAX_COPPER)
+	local amount = Num(f[6], 1, 100000000)
 	if who == "" or not target or not amount then return nil end
 	return { kind = "C", who = who, target = target, tname = Clean(f[5], MAX_NAME),
 		amount = amount, at = at }
@@ -1073,42 +1177,24 @@ function Board.BoardWinner(month)
 	return Board.BoardRanks(month)[1]
 end
 
-function Board.ArchiveMonth(b, month, now)
-	local winner = Board.BoardWinner(month)
-	if winner then
-		local h = { month = month, who = winner.who, count = winner.count,
-			amount = winner.amount, prize = Board.FundForMonth(month),
-			paid = false, by = "", at = math.floor(tonumber(now) or 0) }
-		local a = b.award
-		if a.month == month and SameName(a.who, winner.who) then
-			h.paid, h.by = true, a.by
-		end
-		b.history[#b.history + 1] = h
-		while #b.history > 12 do table.remove(b.history, 1) end
-	end
-end
-
 function Board.BoardRollover(now)
 	local b = Store().board
 	local month = Board.BoardMonth(now)
-	if month == "unknown" then return false end
 	if b.month == month then return false end
-	local closed = {}
-	if b.month == "unknown" or b.month == "" then
-		for _, rec in ipairs(b.ledger) do
-			if rec.month == "unknown" then
-				rec.month = Board.BoardMonth(rec.at)
-				rec.key = rec.month .. "|" .. rec.who:lower() .. "|" .. rec.target
+	if b.month ~= "" and b.month ~= "unknown" then
+		local winner = Board.BoardWinner(b.month)
+		if winner then
+			local h = { month = b.month, who = winner.who, count = winner.count,
+				amount = winner.amount, prize = Board.FundForMonth(b.month),
+				paid = false, by = "", at = math.floor(tonumber(now) or 0) }
+			local a = b.award
+			if a.month == b.month and SameName(a.who, winner.who) then
+				h.paid, h.by = true, a.by
 			end
-			if rec.month ~= "unknown" and rec.month < month then closed[rec.month] = true end
+			b.history[#b.history + 1] = h
+			while #b.history > 12 do table.remove(b.history, 1) end
 		end
-	elseif b.month < month then
-		closed[b.month] = true
 	end
-	local ordered = {}
-	for past in pairs(closed) do ordered[#ordered + 1] = past end
-	table.sort(ordered)
-	for _, past in ipairs(ordered) do Board.ArchiveMonth(b, past, now) end
 	b.month = month
 	local keep = {}
 	for i = 1, #b.ledger do
@@ -1355,16 +1441,596 @@ local function SpotBetter(a, b)
 	return (tonumber(a.at) or 0) >= (tonumber(b.at) or 0)
 end
 
-local function SpotLine(e)
+-- The bare place and time, with no lead-in. Used wherever the line already says "last known
+-- location", so the same place is not named twice in one sentence.
+ns.SpotPlace = function(e)
 	local s = e and e.spot
 	if not s or not s.map then return nil end
 	local zone = MapLib.ZoneName(s.map)
 	local at = ("%.1f, %.1f"):format((tonumber(s.x) or 0) / 10, (tonumber(s.y) or 0) / 10)
 	local where = zone and (zone .. " " .. at) or ("map " .. tostring(s.map) .. " " .. at)
-	if s.kind == "nearby" then
-		return ("last seen near where I died: %s (%s)"):format(where, Ago(s.at))
+	return where .. " (" .. Ago(s.at) .. ")", s.kind == "nearby"
+end
+
+local function SpotLine(e)
+	local place, near = ns.SpotPlace(e)
+	if not place then return nil end
+	if near then return "last seen near where I died: " .. place end
+	return "last seen at " .. place
+end
+
+-- One "last known location" only. A nearby point keeps the word "near" but not a second lead-in.
+ns.KnownSpot = function(e, missing)
+	local place, near = ns.SpotPlace(e)
+	if not place then return "last known location unavailable" .. (missing or "") end
+	return "last known location: " .. (near and "near " or "") .. place
+end
+
+-- LayerSwap keeps a letter for every layer it has stood on: LayerSwapDB.layers[full id].letter,
+-- and every "layer" log row carries that same letter in b. What matters to a player is the letter
+-- (Q, P, ...), not the raw server part of the creature GUID. The numeric key is only used to find
+-- the letter; Layer.key() in LayerSwap.lua is the same "^(%d+)-" rule used here.
+ns.LayerLetter = function(value)
+	if value == nil or Secret(value) then return nil end
+	local s = tostring(value)
+	if s == "" then return nil end
+	if s:match("^%w+$") and not s:match("^%d+$") then return s:upper() end
+	local key = s:match("^(%d+)%-") or s:match("^(%d+)$")
+	if not key then return nil end
+	local db = rawget(_G, "LayerSwapDB")
+	local layers = type(db) == "table" and db.layers or nil
+	if type(layers) ~= "table" then return nil end
+	local best, bestLast
+	for id, l in pairs(layers) do
+		if type(l) == "table" and type(l.letter) == "string" and l.letter ~= "" and not Secret(l.letter) then
+			local idtext = tostring(id)
+			if idtext == key or idtext:match("^(%d+)%-") == key then
+				local last = tonumber(l.last) or 0
+				if not bestLast or last > bestLast then best, bestLast = l.letter:upper(), last end
+			end
+		end
 	end
-	return ("last seen at %s (%s)"):format(where, Ago(s.at))
+	return best
+end
+
+-- One canonical layer for display, wire and storage. A letter is kept as-is; a number from an old
+-- row is used only when LayerSwap can name it. An unmapped number is UNKNOWN, not a raw number and
+-- not this player's current layer - using our own layer here put every unread killer on one layer.
+ns.LayerPart = function(value)
+	if value == nil or Secret(value) then return nil end
+	if type(value) == "number" and value <= 0 then return nil end
+	local s = tostring(value)
+	if s == "" or s == "0" then return nil end
+	-- LayerSwap runs out of letters: layers 27, 28 ... are stored as numeric labels. They are real
+	-- layer names, not raw server numbers, so keep them when the table says that label is in use.
+	local db = rawget(_G, "LayerSwapDB")
+	local layers = type(db) == "table" and db.layers or nil
+	if s:match("^%d+$") and type(layers) == "table" then
+		for _, l in pairs(layers) do
+			if type(l) == "table" and tostring(l.letter) == s then return s end
+		end
+	end
+	if s:match("^%w+$") and not s:match("^%d+$") then return s:upper() end
+	local n = Num(s, 1, 9999999)
+	if not n then return nil end
+	return ns.LayerLetter(n)
+end
+
+-- Empty string on the wire means "unknown"; everywhere else an unknown layer is the number 0 so
+-- saved profiles keep the old shape and the merge code never compares a string with a number.
+ns.LayerWire = function(value)
+	return ns.LayerPart(value) or ""
+end
+
+ns.LayerValue = function(value)
+	return ns.LayerPart(value) or 0
+end
+
+-- LayerSwap reads our own layer from nearby creature GUIDs and keeps the last reading in its log.
+-- A hostile player who killed us stands on the same layer, so that reading is also the killer's
+-- layer. It is used only when no creature in view gave a direct vote; nil still means unknown.
+ns.MyLayer = function()
+	local db = rawget(_G, "LayerSwapDB")
+	local log = type(db) == "table" and db.log or nil
+	if type(log) ~= "table" then return nil end
+	for i = #log, 1, -1 do
+		local row = log[i]
+		if type(row) == "table" and row.kind == "layer" then
+			if type(row.b) == "string" and row.b ~= "" and not Secret(row.b) then
+				return ns.LayerPart(row.b)
+			end
+			if type(row.a) == "string" then
+				local letter = ns.LayerLetter(row.a:match("^(%d+)%-") or row.a)
+				if letter then return letter end
+			end
+		end
+	end
+	return nil
+end
+
+-- Canonical letter for a wire/storage value. An old client's raw number with no LayerSwap entry
+-- stays unknown - it must never be shown as another player's current layer.
+ns.LayerDisplay = function(value)
+	return ns.LayerPart(value)
+end
+
+-- A layer is a live, changing thing: a reading older than an hour is not a layer at all, it is a
+-- stale clue. No chat line, board row, tooltip or fallback may use it after LAYER_TTL. Old rows
+-- without their own stamp fall back to the death/add time, so they expire too.
+ns.LayerFresh = function(src)
+	if not src or src.layerNew ~= true then return nil end
+	local layer = ns.LayerPart(src.klayer)
+	if not layer then return nil end
+	local at = tonumber(src.klayerAt) or 0
+	if at <= 0 then at = tonumber(src.at) or 0 end
+	if at <= 0 or Clock() - at >= LAYER_TTL then return nil end
+	return layer
+end
+
+-- Every unit that can still name a player on this client. Olympus reads the game's GUID token first,
+-- then target/focus/mouseover, party and the nameplates; a death screen hides most of them, so the
+-- wider list matters more than it looks.
+ns.InfoUnits = function()
+	local list = Units()
+	for i = 1, 40 do list[#list + 1] = "raid" .. i end
+	return list
+end
+
+-- UnitLevel is the first source. Some Forever tooltips give a plain level even where UnitLevel is
+-- hidden behind a secret value, so read the tooltip lines too. Both paths fail closed.
+ns.ReadLevel = function(unit)
+	local lv = Num(Ask(UnitLevel, unit), 1, 100)
+	if lv then return lv end
+	if type(C_TooltipInfo) ~= "table" or type(C_TooltipInfo.GetUnit) ~= "function" then return nil end
+	local ok, data = pcall(C_TooltipInfo.GetUnit, unit)
+	if not ok or type(data) ~= "table" or type(data.lines) ~= "table" then return nil end
+	for _, line in ipairs(data.lines) do
+		local text = type(line) == "table" and line.leftText or nil
+		if type(text) == "string" and not Secret(text) then
+			local n = text:match("Level%s+(%d+)") or text:match("^(%d+)")
+			local got = Num(n, 1, 100)
+			if got then return got end
+		end
+	end
+	return nil
+end
+
+-- Full-name key for the guild roster. Deliberately stricter than SameName(): a shared first name
+-- must never turn another player's level into this killer's level.
+ns.NameKey = function(value)
+	local plain = Plain(value)
+	if not plain then return nil end
+	-- A death recap can carry Name-Realm while the roster carries Name; drop only that suffix,
+	-- never a surname, and keep the whole remaining name so a shared first name cannot match.
+	plain = plain:lower():gsub("%-.*$", ""):gsub("%s+", " ")
+	return plain ~= "" and plain or nil
+end
+
+-- Read-only guild roster lookup. It never writes a note and never moves gold; it only turns a name
+-- the client already knows into the level the server publishes for that same name.
+ns.GuildLevel = function(name)
+	local want = ns.NameKey(name)
+	if not want or type(GetNumGuildMembers) ~= "function" or type(GetGuildRosterInfo) ~= "function" then return nil end
+	local ok, total = pcall(GetNumGuildMembers)
+	if not ok or type(total) ~= "number" then return nil end
+	for i = 1, math.min(total, 500) do
+		-- pcall adds its own ok value; GetGuildRosterInfo returns name, rank, rankIndex, level, ...
+		local good, member, _, _, level = pcall(GetGuildRosterInfo, i)
+		if not good then break end
+		if not Secret(member, level) and ns.NameKey(member) == want then
+			local lv = Num(level, 1, 100)
+			if lv then return lv end
+		end
+	end
+	return nil
+end
+
+-- Olympus already records the level of the player who killed us: its evidence rows carry hl (the
+-- Horde player's level as this client saw it), killerGuid and killerName. Reading that saved, read-
+-- only record is the strongest fallback when the death screen hides the killer's unit. A floor
+-- level (hf, the game's "??") is deliberately skipped, and the newest matching row wins.
+ns.OlympusLevel = function(guid, name)
+	local db = rawget(_G, "OlympusDB")
+	local realms = type(db) == "table" and db.realms or nil
+	if type(realms) ~= "table" then return nil end
+	local want = name and ns.NameKey(name) or nil
+	local best, bestAt
+	for _, store in pairs(realms) do
+		local wanted = type(store) == "table" and store.wanted or nil
+		local evidence = type(wanted) == "table" and wanted.evidence or nil
+		if type(evidence) == "table" then
+			for _, e in pairs(evidence) do
+				if type(e) == "table" and not Secret(e.void) and e.void ~= true
+					and not Secret(e.hf) and e.hf ~= true then
+					local lv = Num(e.hl, 1, 100)
+					if lv then
+						local match = false
+						if guid and not Secret(e.killerGuid) and type(e.killerGuid) == "string"
+							and e.killerGuid == guid then
+							match = true
+						elseif want and not Secret(e.killerName) and type(e.killerName) == "string"
+							and ns.NameKey(e.killerName) == want then
+							match = true
+						end
+						if match then
+							local at = Ask(tonumber, e.at) or 0
+							if not bestAt or at >= bestAt then best, bestAt = lv, at end
+						end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- A short sighting cache. On this client the killer's plate is usually gone by the time PLAYER_DEAD
+-- runs, so a level read earlier from a nameplate (or target/focus/mouseover) is kept for two minutes.
+-- Olympus keeps the same kind of cache for the same reason. A level is only stored with a GUID the
+-- client actually gave us; a name match never creates an entry.
+ns.seenLevels = {}
+ns.RememberLevel = function(unit)
+	local guid = Ask(UnitGUID, unit)
+	if type(guid) ~= "string" or guid:sub(1, 7) ~= "Player-" then return nil end
+	local lv = ns.ReadLevel(unit)
+	if not lv then return nil end
+	local now = Clock()
+	ns.seenLevels[guid] = { level = lv, at = now }
+	for g, row in pairs(ns.seenLevels) do
+		if now - (tonumber(row.at) or 0) > 120 then ns.seenLevels[g] = nil end
+	end
+	return lv
+end
+
+-- Session-only proof of what THIS client read for a killer. Guild sync is allowed to move money,
+-- spots, claims and removals, but no older client's row can replace a level or layer we proved.
+-- It dies at logout and is never sent as an extra field. Delete authority comes only from the
+-- guild master or Valar rank; there is no per-player master switch.
+ns.localProof = {}
+ns.RememberKillerInfo = function(guid, level, layer, layerAt, layerNew)
+	if type(guid) ~= "string" or guid == "" then return end
+	local lv = Num(level, 1, 100)
+	local ly = ns.LayerPart(layer)
+	if not lv and not ly then return end
+	local p = ns.localProof[guid]
+	if not p then p = {} ns.localProof[guid] = p end
+	if lv then p.klevel = lv end
+	if ly then
+		p.klayer = ns.LayerValue(ly)
+		p.klayerAt = tonumber(layerAt) or Clock()
+		p.layerNew = layerNew == true
+	end
+end
+
+-- Level and layer of the killer, read while the death is still on screen and shared on both the
+-- board row and the death row. The layer is LayerSwap's letter (P, Q, ...), never the raw server
+-- number; nil means "the client gave us nothing readable", never a guess.
+ns.KillerLine = function(src)
+	if not src then return nil end
+	local level = Num(src.klevel, 1, 100)
+	local layer = ns.LayerFresh(src)
+	if not level and not layer then return nil end
+	if level and layer then return ("level %d, layer %s"):format(level, layer) end
+	if level then return ("level %d"):format(level) end
+	return ("layer %s"):format(layer)
+end
+
+-- Short form for the board row: the long KillerLine would not fit the state column.
+ns.KillerTag = function(src)
+	local level = Num(src and src.klevel, 1, 100)
+	local layer = ns.LayerFresh(src)
+	if not level and not layer then return nil end
+	if level and layer then return ("lvl%d layer %s"):format(level, layer) end
+	if level then return ("lvl%d"):format(level) end
+	return ("layer %s"):format(layer)
+end
+
+-- --------------------------------------------------------------------- swap to the killer's layer
+-- LayerSwap 1.14.40 does not set a layer directly: a host already standing on that layer sends a
+-- group invite, and accepting it moves you across. On live Forever an addon may not post the
+-- "inv layer" chat line, so the line goes into the chat box for the player's own Enter (LayerSwap's
+-- Send.box). The hidden "zone"/"want" notes go out on the click: addon messages are allowed here,
+-- and they are all a LayerSwap host needs to answer that line.
+-- The map id LayerSwap files a layer under: walk up from the current map to the first Zone map.
+-- Everything here lives on ns or inside the functions: this file is at Lua 5.1's 200-local cap.
+ns.PlayerLayerZone = function()
+	local LAYER_ZONE_MAP = (Enum and Enum.UIMapType and Enum.UIMapType.Zone) or 3
+	if type(C_Map) ~= "table" or type(C_Map.GetBestMapForUnit) ~= "function"
+		or type(C_Map.GetMapInfo) ~= "function" then return nil end
+	local ok, id = pcall(C_Map.GetBestMapForUnit, "player")
+	if not ok or Secret(id) or type(id) ~= "number" or id <= 0 then return nil end
+	local zone = id
+	for _ = 1, 6 do
+		local good, info = pcall(C_Map.GetMapInfo, zone)
+		if not good or type(info) ~= "table" or Secret(info.mapType)
+			or type(info.mapType) ~= "number" then break end
+		if info.mapType == LAYER_ZONE_MAP then return zone end
+		local up = info.parentMapID
+		if info.mapType < LAYER_ZONE_MAP or Secret(up) or type(up) ~= "number" or up <= 0 then break end
+		zone = up
+	end
+	return id
+end
+
+-- LayerSwap keeps letter -> full id (LayerSwapDB.layers[id].letter). Its own "/ls swap X" scans
+-- that table filtered to the current zone; this is the same read, newest sighting wins.
+-- LayerSwap files layers under the ZONE NAME (Layer.zone()), not the map id. The hidden "zone"
+-- note and the ask line use the numeric map id; the DB reader must compare the name or it never
+-- finds a host on live Forever.
+ns.PlayerLayerZoneName = function(zone)
+	if not zone then return nil end
+	if type(C_Map) == "table" and type(C_Map.GetMapInfo) == "function" then
+		local ok, info = pcall(C_Map.GetMapInfo, zone)
+		if ok and type(info) == "table" and type(info.name) == "string" and info.name ~= "" then
+			return info.name
+		end
+	end
+	if type(GetRealZoneText) == "function" then
+		local ok, text = pcall(GetRealZoneText)
+		if ok and type(text) == "string" and text ~= "" then return text end
+	end
+	return nil
+end
+
+-- Hidden LayerSwap notes for a swap request. The whisper target can invite by hand; if that
+-- member also hosts LayerSwap, these notes give it the exact zone and layer without putting any
+-- technical tags in the message the player sends.
+ns.SendSwapNotes = function(who, zone, id)
+	local send = SendFn()
+	if not send then return false end
+	pcall(send, "LayerSwap", "zone " .. tostring(zone), "WHISPER", who)
+	pcall(send, "LayerSwap", "want " .. tostring(id), "WHISPER", who)
+	return true
+end
+
+ns.LayerIdFor = function(letter, zone, zoneName)
+	local ly = ns.LayerPart(letter)
+	if not ly then return nil end
+	local db = rawget(_G, "LayerSwapDB")
+	local layers = type(db) == "table" and db.layers or nil
+	if type(layers) ~= "table" then return nil end
+	local best, bestLast
+	for id, l in pairs(layers) do
+		if type(l) == "table" and type(l.letter) == "string" and l.letter:upper() == ly
+			and (not zoneName or l.zone == zoneName or l.zone == zone) then
+			local last = tonumber(l.last) or 0
+			if not bestLast or last >= bestLast then best, bestLast = tostring(id), last end
+		end
+	end
+	return best
+end
+
+-- Ask the guild for an invite to the selected killer's layer. True when a request was set up.
+ns.SwapToLayer = function(entry)
+	local e = entry
+	if not e then
+		Say("select a killer on the board first, then press swap to layer.")
+		return false
+	end
+	local letter = ns.LayerFresh(e)
+	if not letter then
+		Say("that killer's layer is unknown or older than an hour - there is nothing to swap to.")
+		return false
+	end
+	local zone = ns.PlayerLayerZone()
+	if not zone then
+		Say("cannot read your zone - target an NPC or move a little, then try again.")
+		return false
+	end
+	local zoneName = ns.PlayerLayerZoneName(zone)
+	local id = ns.LayerIdFor(letter, zone, zoneName)
+	if not id then
+		Say("layer %s has not been seen in this zone by LayerSwap - no host here can invite you.", letter)
+		return false
+	end
+	-- The bounty's victim is the one who knows the layer he died on. Whisper that member with a
+	-- plain request; a human can invite us, and a LayerSwap host reads the hidden notes as well.
+	local who = e.fundedBy ~= "" and e.fundedBy or nil
+	if not who and type(e.victims) == "table" and #e.victims > 0 then who = e.victims[#e.victims] end
+	if not who or who == "" then who = e.by end
+	who = Clean(who, 24)
+	if who == "" then
+		Say("this bounty has no victim recorded - set it again from the death, then ask for the swap.")
+		return false
+	end
+	if SameName(who, MyName()) then
+		Say("you set this bounty - ask another hunter to swap, or whisper the victim yourself.")
+		return false
+	end
+	ns.SendSwapNotes(who, zone, id)
+	ns.pendingSwap = { target = who, zone = zone, id = id }
+	local line = ("A bounty on %s waits in layer %s - can you invite me to claim it?"):format(
+		e.name ~= "" and e.name or "that killer", letter)
+	local text = (SLASH_WHISPER1 or "/w") .. " " .. who .. " " .. line
+	local open = (type(ChatFrameUtil) == "table" and ChatFrameUtil.OpenChat) or ChatFrame_OpenChat
+	if type(open) == "function" then
+		pcall(open, text)
+		ns.pendingSwap.text = text
+		Say("press Enter to whisper %s for layer %s, then accept the invite.", who, letter)
+	else
+		Say("whisper %s: %s", who, line)
+	end
+	return true
+end
+
+-- Read the killer's level from the unit that killed us, and the layer from the creatures standing
+-- around us. There is no layer API on this client: LayerSwap reads Creature-0-<server>-<map>-... GUIDs
+-- and compares the <server> number, and one creature is enough while nothing else is known. A
+-- player's own pet carries the layer where it was summoned, so player-controlled creatures are
+-- skipped. Every read is guarded; a secret or absent answer is simply left unknown.
+-- atDeath: the one moment when our own LayerSwap layer is valid for the killer. He killed us on
+-- the layer we are standing on, so if no nearby creature gave a letter we may use ours. The same
+-- fallback is never allowed for a later sighting or a synced row: that is what merged everyone.
+ns.KillerInfo = function(guid, name, atDeath)
+	local level, layer
+	local seen, votes = {}, {}
+	local function read(unit)
+		local raw = Ask(UnitGUID, unit)
+		if Secret(raw) or type(raw) ~= "string" or #raw > 64 then return end
+		if raw:sub(1, 7) == "Player-" then ns.RememberLevel(unit) end
+		if guid and raw == guid and Ask(UnitExists, unit) ~= false then
+			local lv = ns.ReadLevel(unit)
+			if lv then level = lv end
+		end
+		-- Creature-0-<server>-<map>-<zoneUID>-<npc>-<spawn>, exactly the fields LayerSwap checks.
+		-- Lua patterns have no alternation, so try the two accepted GUID kinds separately.
+		local zero, server, zone
+		if raw:sub(1, 9) == "Creature-" then
+			zero, server, zone = raw:match("^Creature%-(%d+)%-(%d+)%-(%d+)%-")
+		elseif raw:sub(1, 8) == "Vehicle-" then
+			zero, server, zone = raw:match("^Vehicle%-(%d+)%-(%d+)%-(%d+)%-")
+		end
+		if not zero or zero ~= "0" or not server or not zone then return end
+		if Ask(UnitPlayerControlled, unit) == true then return end
+		if seen[raw] then return end
+		seen[raw] = true
+		local n = Num(server, 1, 9999999)
+		if not n then return end
+		-- LayerSwap compares the numeric key but shows the letter. An unmapped number proves
+		-- nothing about the layer letter, so it is not a vote at all.
+		local part = ns.LayerLetter(n)
+		if part then
+			votes[part] = (votes[part] or 0) + 1
+			layer = part
+		end
+	end
+	-- The game can still hand out a token for the killer's GUID on the death screen; Olympus puts
+	-- that token first for exactly this reason, then falls back to every visible unit.
+	if guid and type(UnitTokenFromGUID) == "function" then
+		local ok, token = pcall(UnitTokenFromGUID, guid)
+		if ok and type(token) == "string" and not Secret(token) then read(token) end
+	end
+	for _, unit in ipairs(ns.InfoUnits()) do read(unit) end
+	-- Some builds hand out plate frames but no nameplateN token. Read the tokens off the plates
+	-- themselves as well, before giving up on the level.
+	if type(C_NamePlate) == "table" and type(C_NamePlate.GetNamePlates) == "function" then
+		local ok, plates = pcall(C_NamePlate.GetNamePlates)
+		if ok and type(plates) == "table" then
+			for _, plate in ipairs(plates) do
+				if type(plate) == "table" then
+					local unit = plate.namePlateUnitToken or plate.unit
+					if unit then read(unit) end
+				end
+			end
+		end
+	end
+	-- Prefer a layer more than one creature agrees on if several letters turned up. Never fall back
+	-- to our own LayerSwap layer: that marked every killer with an unread layer as the same layer.
+	local best, bestN = nil, 0
+	for n, count in pairs(votes) do
+		if count > bestN or (count == bestN and n < (best or n)) then best, bestN = n, count end
+	end
+	if not level and guid then
+		local row = ns.seenLevels[guid]
+		if row and Clock() - (tonumber(row.at) or 0) <= 120 then level = row.level end
+	end
+	-- Last resorts: the guild roster by full name, then Olympus's own saved evidence for this exact
+	-- killer. Both are real client readings, never a guess from a title or a shared first name.
+	if not level and name then level = ns.GuildLevel(name) end
+	if not level then level = ns.OlympusLevel(guid, name) end
+	if level and guid and not ns.seenLevels[guid] then
+		ns.seenLevels[guid] = { level = level, at = Clock() }
+	end
+	local resultLayer = best or layer
+	if not resultLayer and atDeath then resultLayer = ns.MyLayer() end
+	-- A read made outside the death window only proves a level; it must not put a layer on an
+	-- old kill. The death's own AddKill call stores the layer with layerNew set instead.
+	ns.RememberKillerInfo(guid, level, resultLayer, resultLayer and Clock() or nil, false)
+	return level, resultLayer
+end
+
+-- Death rows and this client's own proof can still hold a level the board row lost (an older
+-- guildmate can sync a letter without the number). Read those before saying "unknown" in chat.
+-- Both sources must name this exact GUID, and their layer must still be inside LAYER_TTL.
+ns.ExtraKillerInfo = function(e)
+	if not e then return nil, nil, 0 end
+	local level, layer, layerAt
+	local proof = type(ns.localProof) == "table" and ns.localProof[e.guid] or nil
+	if proof then
+		level = Num(proof.klevel, 1, 100)
+		if ns.LayerFresh(proof) then
+			layer = ns.LayerPart(proof.klayer)
+			layerAt = tonumber(proof.klayerAt) or 0
+		end
+	end
+	local s = Store()
+	if type(s.deaths) == "table" then
+		for _, d in ipairs(s.deaths) do
+			if d.kguid == e.guid then
+				if not level then level = Num(d.klevel, 1, 100) end
+				if not layer and ns.LayerFresh(d) then
+					layer = ns.LayerPart(d.klayer)
+					layerAt = tonumber(d.klayerAt) or tonumber(d.at) or 0
+				end
+				if level and layer then break end
+			end
+		end
+	end
+	return level, layer, layerAt or 0
+end
+
+-- A row rescued from an older profile (or from a death where nothing was readable) can still be
+-- filled in later, but only from a unit we can actually see now. Never invent a number or a layer.
+ns.FillKillerInfo = function(e)
+	if not e then return false end
+	local level, layer = ns.KillerInfo(e.guid, e.name)
+	local layerAt = layer and Clock() or 0
+	local extraLevel, extraLayer, extraAt = ns.ExtraKillerInfo(e)
+	level = level or extraLevel
+	if not layer then layer, layerAt = extraLayer, extraAt end
+	local changed = false
+	if level and not Num(e.klevel, 1, 100) then e.klevel = level changed = true end
+	-- Only a kill captured at death may ever gain a layer. A saved kill seen later keeps its level
+	-- but stays layerless, however clearly the unit is standing in front of us now.
+	if layer and e.layerNew == true then
+		e.klayer = ns.LayerValue(layer)
+		e.klayerAt = layerAt > 0 and layerAt or Clock()
+		changed = true
+	end
+	if changed then
+		ns.RememberKillerInfo(e.guid, e.klevel, e.klayer, e.klayerAt, e.layerNew)
+		Bump(e)
+		Broadcast(e, false)
+	end
+	return changed
+end
+
+-- Existing profiles were saved with klevel/klayer at 0 (or with a raw numeric layer). On login,
+-- repair every row from evidence this client already has, without sending addon traffic: a fresh
+-- death still uses FillKillerInfo and broadcasts normally. Nothing here invents a value.
+ns.BackfillSavedInfo = function()
+	local s = Store()
+	local fixed = 0
+	for _, e in pairs(s.entries) do
+		if type(e) == "table" then
+			local changed = false
+			local mapped = ns.LayerPart(e.klayer)
+			if mapped and mapped ~= tostring(e.klayer) then
+				e.klayer = mapped
+				e.klayerAt = tonumber(e.klayerAt) or tonumber(e.at) or 0
+				changed = true
+			end
+			if not Num(e.klevel, 1, 100) or not ns.LayerFresh(e) then
+				local level, layer = ns.KillerInfo(e.guid, e.name)
+				local layerAt = layer and Clock() or 0
+				local extraLevel, extraLayer, extraAt = ns.ExtraKillerInfo(e)
+				level = level or extraLevel
+				if not layer then layer, layerAt = extraLayer, extraAt end
+				if level and not Num(e.klevel, 1, 100) then e.klevel = level changed = true end
+				if layer and e.layerNew == true then
+					e.klayer = ns.LayerValue(layer)
+					e.klayerAt = layerAt > 0 and layerAt or Clock()
+					changed = true
+				end
+			end
+			if changed then
+				fixed = fixed + 1
+				ns.RememberKillerInfo(e.guid, e.klevel, e.klayer, e.klayerAt, e.layerNew)
+				Bump(e)
+			end
+		end
+	end
+	return fixed
 end
 
 -- Map pins: HereBeDragons-Pins draws these for us from the same 0..1 coordinates used by the board.
@@ -1459,6 +2125,10 @@ end
 
 function MapLib.Refresh()
 	MapLib.pinDirty = false
+	if not ns.Enabled() then
+		MapLib.Release(nil)
+		return 0
+	end
 	local pins = MapLib.Pins()
 	if not pins then
 		MapLib.Release(nil)
@@ -1529,9 +2199,7 @@ local function MapProbeLine()
 end
 
 local function SpotStatus(e)
-	local where = SpotLine(e)
-	if where then return "last known location: " .. where end
-	return "last known location unavailable - the client gave no readable map point (" .. MapProbeLine() .. ")"
+	return ns.KnownSpot(e, " - the client gave no readable map point (" .. MapProbeLine() .. ")")
 end
 
 local function DeathColor(d)
@@ -1569,17 +2237,7 @@ local function SendDigest(urgent)
 		end
 	end
 	if #rows == 0 then return false end
-	local batch, bytes = {}, 0
-	for _, row in ipairs(rows) do
-		-- Keep a set below the 1.0.1 peer timeout (30s at 1.2s per frame).
-		if bytes + #row + 1 > 20 * CHUNK then
-			QueueParts(table.concat(batch, ";"), urgent)
-			batch, bytes = {}, 0
-		end
-		batch[#batch + 1] = row
-		bytes = bytes + #row + (#batch > 1 and 1 or 0)
-	end
-	QueueParts(table.concat(batch, ";"), urgent)
+	QueueParts(table.concat(rows, ";"), urgent)
 	return true
 end
 
@@ -1597,105 +2255,39 @@ local function BankWithdraw()
 	return math.floor(v)
 end
 
-local function BankSeen()
-	local now = BankMoney()
-	if now then DB().bank.seen = now end
-	return now
-end
-
-local function BankLedger()
-	return Store().bank
-end
-
--- Arm a bounty: the entry becomes a pending job at once (stored and shared, so it survives a
--- reload), then the addon watches the bank's gold for it. Arming pays nothing.
+-- A bounty is LIVE the moment a member asks for it. Nobody waits for a bank run and the addon never
+-- reads a balance to decide whether a bounty exists. The requester owes the 1g to the guild bank;
+-- that debt is recorded on the entry and cleared by a manager with /kos paidup <name>.
 local function Fund(entry)
 	if not entry then return false, "no entry" end
-	local funded, want = tonumber(entry.funded) or 0, tonumber(entry.want) or 0
-	if want > 0 and funded >= want then return false, "that bounty is already funded" end
-	local need = math.max(0, want - funded)
-	if need <= 0 then return false, "nothing left to deposit" end
-	if not entry.job then
-		entry.job = true
-		Bump(entry)
-		Broadcast(entry, false)
-	end
-	local now = BankMoney()
-	if not now then
-		return false, "open the guild bank once so the addon can read its gold - no reading, no bounty"
-	end
-	DB().bank.seen = now
-	armed = { guid = entry.guid, base = now, need = need, got = 0, at = Mono() }
-	return true, need
-end
-
--- Every rise the bank shows while a deposit is armed is credited to it, so a 3g then 2g deposit
--- funds a 3g bounty just as well as one 3g deposit does. Only the sum has to reach the need; the
--- whole sum is booked as escrow (ConfirmFunding keeps anything above the ask as float).
-local function CreditArmed(delta)
-	if not armed then return nil end
-	armed.got = (armed.got or 0) + math.max(0, tonumber(delta) or 0)
-	return armed.got, armed.need
-end
-
-local function ConfirmFunding(entry, delta)
-	if not entry or not armed or armed.guid ~= entry.guid then return false end
-	local need = math.max(0, armed.need)
-	local paid = math.min(delta, math.max(need, delta))
-	local credit = math.min(delta, need)
-	entry.funded = (tonumber(entry.funded) or 0) + credit
-	entry.want = math.max(tonumber(entry.want) or 0, tonumber(entry.funded) or 0)
-	entry.fundedBy = MyName()
-	entry.fundedAt = Clock()
-	entry.cutPct = tonumber(DB().cutPercent) or 0
-	local s = Store()
-	s.bank.escrowed = (tonumber(s.bank.escrowed) or 0) + delta
-	s.bank.float = (tonumber(s.bank.float) or 0) + math.max(0, delta - credit)
-	s.bank.at = Clock()
-	armed = nil
-	Bump(entry)
-	Broadcast(entry, false)
-	RefreshIfShown()
 	local e = entry
-	Say("%s is funded with %s. On the kill, %s joins the prize pool and the bank keeps %s.",
-		e.name, Money(entry.funded), Money(PayoutOf(entry.funded)), Money(CutOf(entry.funded)))
-	return true
-end
-
--- Both the event and the manual check consume the same balance reading once.
-local function ObserveDeposit()
-	local now = BankMoney()
-	if not now then return false, "the guild bank's gold cannot be read right now" end
-	local seen = tonumber(DB().bank.seen)
-	DB().bank.seen = now
-	if not armed then return false, "nothing is armed - /kos fund <name> first" end
-	if Mono() - armed.at > 600 then armed = nil return false, "arm the bounty again" end
-	local entry = Entry(armed.guid)
-	if not entry then armed = nil return false, "the entry is gone" end
-	local got, need = CreditArmed(now - (seen or now))
-	if got < need then
-		return false, ("the bank has risen by %s of the %s needed - deposit the rest and try again.")
-			:format(Money(got), Money(need))
-	end
-	return ConfirmFunding(entry, got)
-end
-
--- Start a bounty job from a name: instant, shared, and worth no money yet. Fund() stores and shares
--- the job flag (so it survives a /reload and reaches every guildmate); the bank watcher itself dies
--- with the client, which is why right-clicking again simply re-arms it. The job reads as pending
--- until a verified guild-bank deposit turns it live.
-local function StartJob(entry, speak)
-	if not entry then return false, "no entry" end
-	local e = entry
-	local funded = tonumber(e.funded) or 0
-	local want = tonumber(e.want) or 0
 	if e.paid or e.refunded or e.refundDue then
 		return false, "that bounty is settled - start a new one from the name"
 	end
-	if want > 0 and funded >= want then
+	-- Flat 1g, regardless of any old 3g value still sitting in a saved or synced row.
+	local amount = DEFAULT_REWARD
+	if (tonumber(e.funded) or 0) >= amount then
 		return false, ("%s already has a live bounty"):format(e.name)
 	end
-	local ok, needOrWhy = Fund(e)
+	e.want = amount
+	e.funded = amount
+	e.fundedBy = MyName()
+	e.fundedAt = Clock()
+	e.cutPct = tonumber(DB().cutPercent) or 0
+	e.paidUp = false
+	Bump(e)
+	Broadcast(e, false)
+	RefreshIfShown()
+	return true, amount, amount
+end
+
+-- Ask for a bounty from a name or a right-click. It is live at once and shared on the next message,
+-- so every guildmate sees the same funded row without anybody opening the bank.
+local function StartJob(entry, speak)
+	if not entry then return false, "no entry" end
+	local e = entry
+	local ok, amount, why = Fund(e)
+	if not ok and not why then why = amount end  -- Fund's refusal is its second return
 	-- If he is on screen now, improve the death spot. Never use the reader's own position here.
 	local fresh = CaptureSpot(e.guid, e.name, false)
 	if SpotBetter(fresh, e.spot) then
@@ -1705,18 +2297,17 @@ local function StartJob(entry, speak)
 	end
 	RefreshIfShown()
 	if speak ~= false and DB().notices ~= false then
-		local need = math.max(0, want - funded)
 		local where = SpotLine(e)
 		local suffix = where and (" " .. where) or ""
 		if ok then
-			Say("%s%s|r: |cffffd100pending bounty job|r - deposit %s into the guild bank. It goes live when the bank's own gold shows the money; nobody is paid before that.%s",
-				ClassColor(e), e.name, Money(needOrWhy), suffix)
+			Say("%s%s|r: |cffffd100live %s bounty|r - %s owes the bank that gold until a manager marks it paid (/kos paidup). On the kill, %s joins the prize pool and the bank keeps %s.%s",
+				ClassColor(e), e.name, Money(amount), e.fundedBy ~= "" and e.fundedBy or MyName(),
+				Money(PayoutOf(amount)), Money(CutOf(amount)), suffix)
 		else
-			Say("%s%s|r: |cffffd100pending bounty job|r - deposit %s into the guild bank to make it live. %s%s",
-				ClassColor(e), e.name, Money(need), tostring(needOrWhy), suffix)
+			Say("%s%s|r: %s%s", ClassColor(e), e.name, tostring(why), suffix)
 		end
 	end
-	return true, e, needOrWhy
+	return ok, e, why
 end
 
 -- ============================================================================ applying rows
@@ -1726,38 +2317,50 @@ local function Notify(entry, fresh)
 	local who = ClassColor(entry) .. (entry.name ~= "" and entry.name or "?") .. "|r"
 	local why = entry.kills > 1 and ("%d guild members"):format(entry.kills) or "a guild member"
 	local state = StateOf(entry)
-	local spotLine = SpotLine(entry)
-	local suffix = spotLine and (" last known location: " .. spotLine)
-		or " last known location unavailable - the client gave no readable map point."
-	if state == "pending" then
-		Say("%s killed %s - a |cffffd100pending bounty job|r, not a live bounty. Deposit %s into the guild bank to make it live.%s",
-			who, why, Money(math.max(0, (tonumber(entry.want) or 0) - (tonumber(entry.funded) or 0))), suffix)
-		return
-	end
-	if state == "unfunded" or state == "partly" then
-		Say("%s killed %s - on the board, but no bounty is funded. |cffca9455/kos fund %s|r needs %s.%s",
-			who, why, entry.name, Money((tonumber(entry.want) or 0) - (tonumber(entry.funded) or 0)), suffix)
+	local suffix = " " .. ns.KnownSpot(entry, " - the client gave no readable map point.")
+	local info = ns.KillerLine(entry)
+	local detail = info and (" killer: " .. info .. ".") or ""
+	if state == "unfunded" then
+		Notice("%s killed %s - on the board, nobody has asked for a bounty yet. |cffca9455/kos fund %s|r makes a %s bounty live at once.%s%s",
+			who, why, entry.name, Money(DEFAULT_REWARD), suffix, detail)
 		return
 	end
 	if fresh then
-		Say("%s killed %s - %s bounty, %s joins this month's prize pool.%s",
-			who, why, Money(entry.funded), Money(PayoutOf(entry.funded)), suffix)
+		Notice("%s killed %s - %s bounty, %s joins this month's prize pool.%s%s",
+			who, why, Money(entry.funded), Money(PayoutOf(entry.funded)), suffix, detail)
 	else
-		Say("%s is on the board - %s bounty, %s.%s", who, Money(entry.funded), StateText(entry), suffix)
+		Notice("%s is on the board - %s bounty, %s.%s%s", who, Money(entry.funded), StateText(entry), suffix, detail)
 	end
 end
 
 local function MergeRows(mine, theirs)
 	local merged = mine
 	merged.kills = math.max(mine.kills or 0, theirs.kills or 0)
-	merged.want = math.max(mine.want or 0, theirs.want or 0)
-	merged.funded = math.max(mine.funded or 0, theirs.funded or 0)
+	if (tonumber(theirs.killAt) or 0) > (tonumber(mine.killAt) or 0) then
+		merged.killAt, merged.at = theirs.killAt, theirs.killAt
+	end
+	merged.want = DEFAULT_REWARD
+	merged.funded = math.min(math.max(mine.funded or 0, theirs.funded or 0), DEFAULT_REWARD)
 	merged.paid = mine.paid or theirs.paid
 	merged.refunded = mine.refunded or theirs.refunded
 	merged.refundDue = mine.refundDue or theirs.refundDue
-	-- a started job is never un-started by an older/quieter row: it stays pending until a verified
-	-- deposit makes it live (or the killer is paid and the entry is reopened for a new one)
-	if theirs.job or mine.job then merged.job = true end
+	-- once a manager has cleared a member's debt, no older row can put it back
+	merged.paidUp = mine.paidUp or theirs.paidUp
+	if (theirs.clearedAt or 0) > (mine.clearedAt or 0) then
+		merged.clearedAt, merged.clearedBy = theirs.clearedAt, theirs.clearedBy
+	end
+	if (theirs.reborn or 0) > (mine.reborn or 0) then merged.reborn = theirs.reborn end
+	if (theirs.klevel or 0) > (mine.klevel or 0) then merged.klevel = theirs.klevel end
+	-- A layer is only a letter while it is inside its hour. Never copy an expired one, and never
+	-- let an old client's row put a stale letter back over a newer reading we already have.
+	local mineLayer, theirsLayer = ns.LayerFresh(mine), ns.LayerFresh(theirs)
+	local mineLayerAt = tonumber(mine.klayerAt) or tonumber(mine.at) or 0
+	local theirsLayerAt = tonumber(theirs.klayerAt) or tonumber(theirs.at) or 0
+	if theirsLayer and (not mineLayer or theirsLayerAt > mineLayerAt) then
+		merged.klayer = ns.LayerValue(theirsLayer)
+		merged.klayerAt = theirsLayerAt
+		merged.layerNew = true
+	end
 	-- keep the freshest sighting, so a later live sighting wins over an old "near where I died"
 	if SpotBetter(theirs.spot, mine.spot) then merged.spot = theirs.spot end
 	if (theirs.name or "") ~= "" then merged.name = theirs.name end
@@ -1776,24 +2379,33 @@ local function MergeRows(mine, theirs)
 	return merged
 end
 
+-- A level or layer this client proved is never lost to a guild row. Money, spots, claims and
+-- removals still sync normally; only these two fields are pinned for the rest of the session.
+local function KeepLocalProof(e)
+	local p = type(ns.localProof) == "table" and ns.localProof[e.guid] or nil
+	if not p then return end
+	if Num(p.klevel, 1, 100) then e.klevel = p.klevel end
+	local proofLayer = ns.LayerFresh(p)
+	if proofLayer then
+		e.klayer = ns.LayerValue(proofLayer)
+		e.klayerAt = tonumber(p.klayerAt) or 0
+		e.layerNew = true
+	end
+end
+
 local function ApplyEntry(remote)
 	local s = Store()
-	local tomb = s.removed[remote.guid]
-	if tomb and tonumber(tomb) >= remote.stamp then return false end
-	if Guid(remote.guid) and remote.name ~= "" then
-		local alias = "n:" .. remote.name:lower()
-		local loose = s.entries[alias]
-		if not loose or loose.stamp <= remote.stamp then
-			s.entries[alias] = nil
-			s.removed[alias] = math.max(s.removed[alias] or 0, remote.stamp)
-		end
-	end
+	-- A manager's delete is final. An ordinary copy of the row never brings a deleted name back,
+	-- however new its stamp looks on another clock. Only a fresh add (reborn > the delete) can.
+	local tomb = tonumber(s.removed[remote.guid]) or 0
+	if tomb > 0 and (tonumber(remote.reborn) or 0) <= tomb then return false end
 	local mine = s.entries[remote.guid]
 	local fresh = mine == nil
 	if mine then
 		if remote.stamp < mine.stamp then return false end
 		if remote.stamp == mine.stamp then
 			local merged = MergeRows(mine, remote)
+			KeepLocalProof(merged)
 			Bump(merged)
 			s.entries[remote.guid] = merged
 			Broadcast(merged, true)
@@ -1802,14 +2414,21 @@ local function ApplyEntry(remote)
 		end
 	end
 	Observe(remote.stamp)
-	remote.at = Clock()
+	-- The shared kill time decides the board order. A sync arriving late must not move a name to
+	-- the top; only an actual new kill does that. An old client has no killAt field at all - keep
+	-- the at time it sent instead of stamping Clock(), which made an old row look freshly killed.
+	local kt = tonumber(remote.killAt) or 0
+	if kt > 0 then remote.at = kt else remote.at = tonumber(remote.at) or Clock() end
 	remote.auto = false
 	remote.src = "shared"
+	KeepLocalProof(remote)
 	s.entries[remote.guid] = remote
 	-- A newly shared row can carry a last-known spot. Without this the pin ticker sees nothing
 	-- dirty and a guildmate's map stays empty until he reloads or runs /kos pins by hand.
 	if remote.spot then MapLib.pinDirty = true end
-	if tomb then s.removed[remote.guid] = nil end
+	-- A row arriving already funded must put its skull up on this client straight away.
+	if ns.RefreshMarks then pcall(ns.RefreshMarks) end
+	if tomb > 0 then s.removed[remote.guid] = nil end
 	stats.applied = stats.applied + 1
 	if not remote.quiet then Notify(remote, fresh) end
 	Trim()
@@ -1820,16 +2439,19 @@ end
 local function ApplyRemoval(row, sender)
 	if not Board.CanManage(sender) then return false end
 	local f = Fields(row)
-	local guid = Board.TargetID(f[2])
+	local guid = Guid(f[2])
 	local stamp = Num(f[3], 0, 4294967295)
 	if not guid or not stamp then return false end
 	local s = Store()
 	Observe(stamp)
 	local mine = s.entries[guid]
-	if mine and tonumber(mine.stamp) > stamp then return false end
+	-- A delete from a manager wins over every older copy of the row. Only a genuine fresh add on
+	-- this client (reborn newer than the delete) outranks it, so an old R row cannot erase it.
+	if mine and (tonumber(mine.reborn) or 0) > stamp then return false end
 	s.entries[guid] = nil
 	if stamp > (tonumber(s.removed[guid]) or -1) then s.removed[guid] = stamp end
 	MapLib.pinDirty = true
+	if ns.RefreshMarks then pcall(ns.RefreshMarks) end
 	RefreshIfShown()
 	return true
 end
@@ -1890,18 +2512,12 @@ local function OnAddonMessage(prefix, text, dist, sender)
 	local id, index, count = text:match("^C(%d+):(%d+):(%d+):")
 	if id then
 		id, index, count = tonumber(id), tonumber(index), tonumber(count)
-		if not id or not index or not count or count < 1 or count > MAX_PARTS or index < 1 or index > count then return end
+		if not id or not index or not count or count < 1 or count > 40 or index < 1 or index > count then return end
 		local body = text:match("^C%d+:%d+:%d+:(.*)$") or ""
-		if type(sender) ~= "string" or sender == "" then return end
-		local key = sender .. ":" .. id
-		local now = Mono()
-		for oldKey, old in pairs(parts) do
-			if now - old.at > 30 then parts[oldKey] = nil end
-		end
-		local slot = parts[key]
-		if not slot or slot.count ~= count then
+		local slot = parts[id]
+		if not slot or slot.count ~= count or Mono() - slot.at > 30 then
 			slot = { count = count, got = {}, seen = 0, at = Mono() }
-			parts[key] = slot
+			parts[id] = slot
 		end
 		if not slot.got[index] then
 			slot.got[index] = body
@@ -1910,7 +2526,7 @@ local function OnAddonMessage(prefix, text, dist, sender)
 		if slot.seen == count then
 			local whole = {}
 			for i = 1, count do whole[i] = slot.got[i] or "" end
-			parts[key] = nil
+			parts[id] = nil
 			Handle(table.concat(whole), sender)
 		end
 		return
@@ -1920,7 +2536,7 @@ end
 
 -- ============================================================================ the board
 
-local function AddKill(guid, name, class, src, reason, spot)
+local function AddKill(guid, name, class, src, reason, spot, klevel, klayer)
 	guid = Guid(guid)
 	if not guid then return nil, "no guid" end
 	local s = Store()
@@ -1946,36 +2562,54 @@ local function AddKill(guid, name, class, src, reason, spot)
 	if not e then
 		e = {
 			guid = guid, name = name, class = class, kills = 0,
-			want = 0, funded = 0, auto = true, at = now, by = me, src = src or "death",
+			want = 0, funded = 0, auto = true, at = now, killAt = now, by = me, src = src or "death",
 			reason = "", victims = {}, claims = {}, paid = false,
+			klevel = 0, klayer = 0, klayerAt = 0, layerNew = false, paidUp = false,
 		}
 		s.entries[guid] = e
 	elseif e.refundDue then
-		-- that deposit is still owed back to its payer, so it cannot fund this kill as well:
-		-- the old refund stays on the officers' list and this kill waits for a fresh deposit
+		-- that refund is still owed back to its payer, so this kill waits for a fresh request
 		e.paidTo, e.paidAt = nil, nil
 		e.claims = {}
-		e.job = false
+		e.paidUp = false
 	elseif e.paid or e.refunded then
-		-- a settled bounty does not pay twice: his next kill needs a fresh job and deposit
+		-- a settled bounty does not pay twice: his next kill needs a fresh request
 		e.paid = false
 		e.refunded = nil
+		e.refundDue = nil
 		e.funded = 0
-		e.job = false
+		e.paidUp = false
 		e.fundedBy, e.fundedAt, e.paidTo, e.paidAt = nil, nil, nil, nil
 		e.refundedTo, e.refundedAt = nil, nil
+		e.clearedAt, e.clearedBy = nil, nil
 		e.claims = {}
 	end
 	e.kills = (tonumber(e.kills) or 0) + 1
-	e.at = now
+	e.at, e.killAt = now, now
 	if spot then e.spot = spot end
 	if name ~= "" then e.name = name end
 	if class ~= "" then e.class = class end
+	if Num(klevel, 1, 100) then e.klevel = klevel end
+	-- Only the death that puts him on the board is a new kill. A row restored from shared history
+	-- carries the old letter too, but it must never be shown again. Marking the kill new even when
+	-- no layer was readable lets the delayed sighting fill one in inside that first hour.
+	if src == "death" then
+		e.layerNew = true
+		if ns.LayerPart(klayer) then
+			e.klayer = ns.LayerValue(klayer)
+			e.klayerAt = now
+		end
+	end
+	ns.RememberKillerInfo(guid, e.klevel, e.klayer, e.klayerAt, e.layerNew)
 	e.want = math.max(tonumber(DB().defaultReward) or 0, tonumber(e.funded) or 0)
 	e.cutPct = tonumber(e.cutPct) or tonumber(DB().cutPercent) or 0
 	e.reason = Clean(reason or (src == "manual" and ("added by " .. me) or ("killed " .. me)), MAX_REASON)
 	AddUnique(e.victims, me, MAX_VICTIMS)
 	Bump(e)
+	-- A name added again is a new life for this guid. The birth stamp travels on the row so every
+	-- client can clear its delete marker; an old copy without it stays deleted.
+	e.reborn = e.stamp
+	if s.removed[guid] then s.removed[guid] = nil end
 	Trim()
 	Notify(e, e.kills == 1)
 	Broadcast(e, false)
@@ -1986,11 +2620,11 @@ end
 local PoolKill
 
 local function ClaimKill(guid, who)
-	local e = Entry(Guid(guid))
+	local e = Entry(guid)
 	if not e or e.paid then return false, "paid" end
 	who = Clean(who or MyName(), MAX_NAME)
 	if (tonumber(e.funded) or 0) <= 0 then
-		Say("%s killed %s, but no bounty is funded - nothing joins the prize pool.", who, e.name)
+		Notice("%s killed %s, but no bounty is funded - nothing joins the prize pool.", who, e.name)
 		return false, "unfunded"
 	end
 	AddClaim(e, who, Clock())
@@ -2119,7 +2753,116 @@ local function Sweep()
 	end
 end
 
--- ============================================================================ what the bank owes
+-- ============================================================================ who owes what
+
+-- A live bounty is on trust: the member who asked for it owes 1g to the bank until a manager marks
+-- him paid up. This list is derived from the shared entries, so every client agrees on it and no
+-- extra wire message is needed - field 23 of an E row carries the cleared flag.
+local function Ious()
+	local out = {}
+	for _, e in pairs(Store().entries) do
+		local amount = tonumber(e.funded) or 0
+		if amount > 0 and not e.paidUp and not e.refunded and not e.refundDue then
+			out[#out + 1] = {
+				kind = "iou", name = e.fundedBy ~= "" and e.fundedBy or "the requester",
+				amount = amount, target = e.name, entry = e,
+			}
+		end
+	end
+	table.sort(out, function(a, b)
+		if (a.name or "") ~= (b.name or "") then return (a.name or "") < (b.name or "") end
+		return (a.target or "") < (b.target or "")
+	end)
+	return out
+end
+
+-- GM or Valar clears one member's whole unpaid list. It is a bookkeeping flag on the shared rows;
+-- the addon never takes or gives a copper.
+local function PaidUp(name, by)
+	if not Board.CanManage() then return false, Board.DENIED end
+	name = Clean(name or "", MAX_NAME)
+	if name == "" then return false, "usage: /kos paidup <name>" end
+	local n = 0
+	for _, e in pairs(Store().entries) do
+		if (tonumber(e.funded) or 0) > 0 and not e.paidUp
+			and not e.refunded and not e.refundDue and SameName(e.fundedBy, name) then
+			e.paidUp = true
+			-- Kept on the shared row so the ledger can show the date and the person who cleared it
+			-- on every client, not just the one that pressed the button.
+			e.clearedAt, e.clearedBy = Clock(), Clean(by or MyName(), 24)
+			Board.Audit("U", by or MyName(), e.name, "debt cleared for " .. name)
+			Bump(e)
+			Broadcast(e, false)
+			n = n + 1
+		end
+	end
+	RefreshIfShown()
+	if n == 0 then return false, ("no unpaid bounty is owed by %s"):format(name) end
+	Say("%s is marked paid up - %d bounty debt%s cleared.", name, n, n == 1 and "" or "s")
+	return true, n
+end
+
+-- Declared here so the ledger's frozen-order helpers below capture this ui table, not a global.
+local rowHeight, ui = 18, {}
+
+-- The debts ledger. Every bounty paid on trust stays here after it is cleared, so the window shows
+-- both what is owed now and what was paid up before. It is derived from the shared rows, so a
+-- guildmate's /kos paidup reaches everybody; fields 31/32 carry the cleared date and cleanser.
+ns.DebtLedger = function()
+	local out = {}
+	for _, e in pairs(Store().entries) do
+		local amount = tonumber(e.funded) or 0
+		local who = Clean(e.fundedBy, 24)
+		if amount > 0 and who ~= "" then
+			local status, when, by, rank
+			if e.refunded then
+				status, when, by, rank = "refunded", e.refundedAt, e.refundedTo, 3
+			elseif e.refundDue then
+				status, when, by, rank = "refund due", e.fundedAt, "", 1
+			elseif e.paidUp then
+				status, when, by, rank = "paid up", e.clearedAt, e.clearedBy, 2
+			else
+				status, when, by, rank = "owes bank", e.fundedAt, "", 0
+			end
+			out[#out + 1] = {
+				guid = e.guid, who = who, amount = amount,
+				target = Clean(e.name, MAX_NAME) or "?", status = status,
+				when = tonumber(when) or 0, by = by or "", rank = rank,
+			}
+		end
+	end
+	table.sort(out, function(a, b)
+		if a.rank ~= b.rank then return a.rank < b.rank end
+		if a.when ~= b.when then return a.when > b.when end
+		return (a.who or "") < (b.who or "")
+	end)
+	return out
+end
+
+-- Same rule as the enemy board: the visible order is frozen while the tab is open. A sync that
+-- clears a debt must not reshuffle the names already on screen.
+ns.FreezeLedgerOrder = function()
+	ui.ledgerOrder, ui.ledgerFresh = {}, true
+	for i, row in ipairs(ns.DebtLedger()) do ui.ledgerOrder[i] = row.guid end
+end
+
+local function LedgerRows()
+	 local all = ns.DebtLedger()
+	 if type(ui.ledgerOrder) ~= "table" then ns.FreezeLedgerOrder() end
+	 local byGuid, list, seen = {}, {}, {}
+	 for i = 1, #all do byGuid[all[i].guid] = all[i] end
+	 for i = 1, #ui.ledgerOrder do
+		 local row = byGuid[ui.ledgerOrder[i]]
+		 if row then list[#list + 1] = row seen[row.guid] = true end
+	 end
+	 for i = 1, #all do
+		 if not seen[all[i].guid] then
+			 list[#list + 1] = all[i]
+			 ui.ledgerOrder[#ui.ledgerOrder + 1] = all[i].guid
+		 end
+	 end
+	 return list
+end
 
 -- Every payment the bank still has to make, derived from the board itself so it travels with it:
 --   monthly this month's single prize pool (all the 70% shares), owed to the board leader;
@@ -2173,21 +2916,34 @@ local function OwedTotal(list)
 	return total
 end
 
--- The line that goes to the officers. Short enough for one chat message.
+-- The line that goes to the officers. Short enough for one chat message: members who still owe
+-- the bank for a live bounty first, then the payments the bank has not handed over yet.
 local function OwedLine(limit)
-	local list = Debts()
-	if #list == 0 then return nil end
+	local bank, ious = Debts(), Ious()
+	if #bank == 0 and #ious == 0 then return nil end
 	limit = limit or OFFICER_LIST
 	local bits = {}
-	for i = 1, math.min(#list, limit) do
-		local d = list[i]
-		bits[#bits + 1] = ("%s %s %s"):format(
-			Money(d.amount), d.kind == "refund" and "back to"
-				or (d.kind == "monthly" and "prize pool to" or "to"), d.to)
+	if #ious > 0 then
+		local names, total = {}, 0
+		for i = 1, #ious do
+			total = total + (tonumber(ious[i].amount) or 0)
+			AddUnique(names, ious[i].name, 4)
+		end
+		if #names < #ious then names[#names + 1] = ("+%d more"):format(#ious - #names) end
+		bits[#bits + 1] = ("members owe bank %s (%s)"):format(Money(total), table.concat(names, ", "))
 	end
-	if #list > limit then bits[#bits + 1] = ("+%d more"):format(#list - limit) end
-	return ("[KoS] guild bank still owes %s: %s - not handed over yet (/kos owed)"):format(
-		Money(OwedTotal(list)), table.concat(bits, ", "))
+	if #bank > 0 then
+		local paid = {}
+		for i = 1, math.min(#bank, limit) do
+			local d = bank[i]
+			paid[#paid + 1] = ("%s %s %s"):format(
+				Money(d.amount), d.kind == "refund" and "back to"
+					or (d.kind == "monthly" and "prize pool to" or "to"), d.to)
+		end
+		if #bank > limit then paid[#paid + 1] = ("+%d more"):format(#bank - limit) end
+		bits[#bits + 1] = ("bank owes %s: %s"):format(Money(OwedTotal(bank)), table.concat(paid, ", "))
+	end
+	return ("[KoS] %s - /kos owed"):format(table.concat(bits, "; "))
 end
 
 -- Officer chat only exists for the guild master and the first rank under him; "auto" uses what the
@@ -2210,8 +2966,8 @@ end
 -- Chat needs a real key press or click on this client, so this is only ever called from a click or a
 -- typed command. If the client refuses, the line lands in the chat box for one Enter.
 local function PostOwed(channel)
-	local list = Debts()
-	if #list == 0 then Say("nothing is owed right now - the bank is square.") return false, "nothing" end
+	local list, ious = Debts(), Ious()
+	if #list == 0 and #ious == 0 then Say("nothing is owed right now - the bank is square.") return false, "nothing" end
 	local text = OwedLine()
 	if #text > MSG_MAX then text = text:sub(1, MSG_MAX - 3) .. "..." end
 	local ch = channel or OfficerChannel()
@@ -2234,17 +2990,25 @@ end
 -- every OFFICER_REMIND seconds for as long as one payment is open.
 local function Remind()
 	if DB().notices == false then return end
-	local list = Debts()
-	if #list == 0 then return end
-	Say("|cffffd100the guild bank still owes %s|r (%d payment%s not handed over yet).",
-		Money(OwedTotal(list)), #list, #list == 1 and "" or "s")
-	for i = 1, math.min(#list, 4) do
-		local d = list[i]
-		Say("  %s: %s %s", d.name, Money(d.amount),
-			d.kind == "refund" and ("back to " .. d.to)
-			or (d.kind == "monthly" and ("prize pool to " .. d.to)) or ("to " .. d.to))
+	local list, ious = Debts(), Ious()
+	if #list == 0 and #ious == 0 then return end
+	if #ious > 0 then
+		local total = 0
+		for i = 1, #ious do total = total + (tonumber(ious[i].amount) or 0) end
+		Say("|cffffd100members still owe the bank %s|r (%d live bounty debt%s - /kos paidup <name>).",
+			Money(total), #ious, #ious == 1 and "" or "s")
 	end
-	if #list > 4 then Say("  and %d more - /kos owed", #list - 4) end
+	if #list > 0 then
+		Say("|cffffd100the guild bank still owes %s|r (%d payment%s not handed over yet).",
+			Money(OwedTotal(list)), #list, #list == 1 and "" or "s")
+		for i = 1, math.min(#list, 4) do
+			local d = list[i]
+			Say("  %s: %s %s", d.name, Money(d.amount),
+				d.kind == "refund" and ("back to " .. d.to)
+				or (d.kind == "monthly" and ("prize pool to " .. d.to)) or ("to " .. d.to))
+		end
+		if #list > 4 then Say("  and %d more - /kos owed", #list - 4) end
+	end
 	Say("  click |cffffd100Officers|r in the window or type |cffffd100/kos officers|r to say it in %s.",
 		OfficerChannel() == "OFFICER" and "officer chat" or "guild chat")
 end
@@ -2261,7 +3025,15 @@ local function Remove(guid, force)
 	end
 	s.entries[guid] = nil
 	Bump(e)
-	s.removed[guid] = clock
+	-- A delete by the guild master or Valar is final. Use server time and the row's own birth stamp
+	-- as the floor so an old client with a higher local counter cannot bring a stale copy back.
+	-- This is the manager's own action, not a saved mode or a standing sync ticker.
+	local born = tonumber(e.reborn) or 0
+	local base = math.max(clock + 1, Clock(), born + 1, 1)
+	if base > 4294967290 then base = clock + 1 end
+	clock = base
+	DB().clock = clock
+	s.removed[guid] = base
 	Board.Audit("R", MyName(), e.name, StateText(e) .. ", funded " .. Money(e.funded))
 	MapLib.pinDirty = true
 	BroadcastRemoval(guid)
@@ -2399,16 +3171,16 @@ local function CaptureDeath(serial)
 	end
 	local kb, why = KillingBlowRecap(events)
 	if not kb then lastWhy = why or "no killing blow in the recap" return false end
-	-- (From here the row says a player was involved, so a refusal is worth a chat line: it is the
-	-- only visible sign that a death happened and nothing came of it. Once per death, because the
-	-- watch keeps asking while the player stays dead.)
+	-- (From here the row says a player was involved, so a refusal is worth keeping: it is the
+	-- only visible sign that a death happened and nothing came of it. It goes to the hidden
+	-- notice buffer, not chat. Once per death, because the watch keeps asking while dead.)
 	local playerLike = kb.flags ~= nil and HasBit(kb.flags, 0x40)
 	local noticeKey = tostring(kb.stamp or ("d" .. tostring(serial or deathSerial)))
 	local function Refuse(reason)
 		lastWhy = reason
 		if playerLike and DB().notices ~= false and noticeKey ~= lastNoticeKey then
 			lastNoticeKey = noticeKey
-			Say("died to %s, but nothing was recorded: %s.", kb.name ~= "" and kb.name or "a player", reason)
+			Notice("died to %s, but nothing was recorded: %s.", kb.name ~= "" and kb.name or "a player", reason)
 		end
 		return false
 	end
@@ -2444,19 +3216,33 @@ local function CaptureDeath(serial)
 	-- Look for him while the client can still see him. This has to happen before the board row is
 	-- built because the spot is part of the row we share with the guild.
 	local spot = CaptureSpot(guid, name, true)
-	local e = AddKill(guid, name, ClassFromGUID(guid) or "", "death", nil, spot)
+	-- Read level and layer now, before the client drops the killer's plate after the death.
+	local level, layer = ns.KillerInfo(guid, name, true)
+	local e = AddKill(guid, name, ClassFromGUID(guid) or "", "death", nil, spot, level, layer)
 	-- The guild's death feed: who killed whom, so every member sees the same history and can click
-	-- the killer's name to start a bounty (the click is where the money rule begins, not here).
-	RecordDeath(guid, name, (e and e.class) or ClassFromGUID(guid) or "", MyName(), myGuid, spot)
-	lastWhy = e and ("counted: " .. e.name) or "the board refused the kill"
+	-- the killer's name to ask for a bounty (the click is where the money rule begins, not here).
+	RecordDeath(guid, name, (e and e.class) or ClassFromGUID(guid) or "", MyName(), myGuid, spot, level, layer)
+	-- The death screen often hides the killer's plate. Try again while he may still be on screen;
+	-- only a real reading is kept - an unread layer stays unknown, never this player's layer.
+	if e and type(C_Timer) == "table" and type(C_Timer.After) == "function" then
+		for _, delay in ipairs({ 1, 4 }) do
+			C_Timer.After(delay, function()
+				if Entry(e.guid) == e then pcall(ns.FillKillerInfo, e) end
+			end)
+		end
+	end
+	lastWhy = e and ("counted: " .. e.name .. (ns.KillerLine(e) and (" (" .. ns.KillerLine(e) .. ")") or ""))
+		or "the board refused the kill"
 	if DB().notices ~= false then
 		if e then
 			local where = SpotLine(e)
-			Say("%s killed you - added to the kill on sight list (%s asked). Not a bounty yet: the gold goes into the guild bank first. Where you were killed: %s",
+			local info = ns.KillerLine(e)
+			Notice("%s killed you - added to the kill on sight list (a bounty asks for %s, live as soon as you request it).%s Where you were killed: %s",
 				e.name, Money(tonumber(e.want) or 0),
+				info and (" Killer: " .. info .. ".") or "",
 				where or "no readable map point - /kos where shows what the client exposed")
 		elseif playerLike then
-			Say("died to %s, but nothing was recorded: %s.", name, tostring(lastWhy))
+			Notice("died to %s, but nothing was recorded: %s.", name, tostring(lastWhy))
 		end
 	end
 	return e ~= nil
@@ -2497,16 +3283,18 @@ end
 
 local function AnnounceText(e)
 	if not e then return nil end
-	local where = SpotLine(e)
-	local suffix = where and (" last known location: " .. where)
-		or " last known location unavailable."
+	local suffix = " " .. ns.KnownSpot(e, ".")
 	local state = StateOf(e)
-	if state == "unfunded" or state == "partly" or state == "pending" then
-		return ("[KoS] %s is kill on sight - no bounty funded yet (%s needed).%s"):format(
-			e.name, Money((tonumber(e.want) or 0) - (tonumber(e.funded) or 0)), suffix)
+	local info = ns.KillerLine(e)
+	-- Put the killer line before the location: chat truncates at 250 characters, and the location
+	-- is the longest part. Losing the level/layer to the cut is what made them look unimplemented.
+	local lead = info and (" Killer: " .. info .. ".") or ""
+	if state == "unfunded" then
+		return ("[KoS] %s%s is kill on sight - no bounty requested yet (%s).%s"):format(
+			e.name, lead, Money(DEFAULT_REWARD), suffix)
 	end
-	return ("[KoS] %s is kill on sight - %s bounty, %s joins the prize pool on the kill, the bank keeps %s.%s"):format(
-		e.name, Money(e.funded), Money(PayoutOf(e.funded)), Money(CutOf(e.funded)), suffix)
+	return ("[KoS] %s%s is kill on sight - %s live bounty, %s joins the prize pool on the kill, the bank keeps %s.%s"):format(
+		e.name, lead, Money(e.funded), Money(PayoutOf(e.funded)), Money(CutOf(e.funded)), suffix)
 end
 
 local function Announce(entry)
@@ -2536,7 +3324,8 @@ end
 
 local ROWS = 10
 local DEATH_ROWS = 5
-local rowHeight, ui = 20, {}
+-- 18 px rows leave a real footer in each list. At 20 px the last row touched
+-- the constantly-changing spot and hint lines, which then wrapped over it.
 local MEDIA = "Interface\\AddOns\\OlympusMytikas\\Media\\"
 
 -- Forever's own window art, the same pieces the installed Happy Camper addon uses, so the board
@@ -2662,12 +3451,14 @@ end
 -- First-run notice. It is shown once per account, on install/login, and cannot be closed with the
 -- X or Escape: the only way past it is the acknowledgement button, which the reader has to tick.
 -- The frame lives on ns, not in a new main-chunk local: Lua 5.1 allows only 200 of those here.
-local function ShowWelcome()
-	if DB().welcomeAck then return end
+-- force is only used by /kos notice: replay the page for somebody who already
+-- ticked it, without changing their acknowledgement.
+local function ShowWelcome(force)
+	if DB().welcomeAck and not force then return end
 	local welcome = ns.welcome
 	if not welcome then
 		local name = "KillOnSightWelcome"
-		welcome = MakeWindow(name, 560, 520, "DIALOG")
+		welcome = MakeWindow(name, 560, 920, "DIALOG")
 		ns.welcome = welcome
 		Dress(welcome, "Kill on Sight - read this once", MEDIA .. "emblem")
 		if welcome.CloseButton then welcome.CloseButton:Hide() end
@@ -2677,38 +3468,45 @@ local function ShowWelcome()
 			end
 		end
 
-		local box = Inset(welcome, 22, -72, -22, 112)
-		-- They were ticking without reading, so the warning gets its own big bold green line at
-		-- the top. 2002B.TTF is this client's bold face; the huge font object is the fallback.
+		local box = Inset(welcome, 22, -72, -22, 92)
+		-- They were ticking without reading, so the warning gets its own measured band at
+		-- the top. The three wrapped lines used to grow down over the rules below them.
 		local warn = box:CreateFontString(nil, "OVERLAY", "GameFontNormalHuge")
-		warn:SetPoint("TOPLEFT", 18, -14)
+		warn:SetPoint("TOPLEFT", 18, -20)
 		warn:SetWidth(480)
-		warn:SetJustifyH("LEFT")
+		warn:SetHeight(76)
+		warn:SetJustifyH("CENTER")
 		warn:SetJustifyV("TOP")
 		warn:SetWordWrap(true)
 		warn:SetTextColor(0.25, 1, 0.25)
-		pcall(function() warn:SetFont("Fonts\\2002B.TTF", 24, "OUTLINE") end)
-		warn:SetText("HEY DICK HEAD. DONT YOU DARE TICK THAT BOX WITHOUT READ THIS FIRST. DONT BE A MORON")
+		pcall(function() warn:SetFont("Fonts\\2002B.TTF", 20, "OUTLINE") end)
+		warn:SetText("HEY DICK HEAD. DONT YOU DARE TICK THAT BOX WITHOUT READING THIS FIRST. DONT BE A MORON")
 		welcome.warning = warn
 		local body = box:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-		body:SetPoint("TOPLEFT", 18, -80)
-		body:SetPoint("BOTTOMRIGHT", -18, 16)
+		body:SetPoint("TOPLEFT", 18, -108)
+		body:SetPoint("BOTTOMRIGHT", -18, 20)
 		body:SetJustifyH("LEFT")
 		body:SetJustifyV("TOP")
 		body:SetWordWrap(true)
 		body:SetText("KILL ON SIGHT - HOW IT WORKS\n\n" ..
-			"1. An enemy who kills a guild member goes on the shared board automatically.\n" ..
-			"2. A name, even a 'pending job', is NOT a bounty and pays nothing.\n" ..
-			"3. Whoever wants it must put the gold (3g) into the guild bank first.\n" ..
-			"   The addon only calls it a bounty when the bank's own gold rises.\n" ..
-			"4. DO NOT GO HUNTING until the row says 'bounty'. A name is not a promise.\n" ..
-			"5. On a kill the bank keeps 30% (90s of a 3g bounty). The hunter's\n" ..
-			"   70% (2g10s) is NOT paid per kill - it joins one prize pool.\n" ..
-			"6. The top hunter that month wins the whole pool.\n" ..
-			"7. Unclaimed money goes back to the payer after 7 days, by hand.\n" ..
-			"8. Right-click a name to start a pending job. Open the guild bank once first\n" ..
-			"   so the addon can read its balance.\n\n" ..
-			"/kos opens the board. The map pins are addon-only and retire after 30 minutes.")
+			"1. BOARD (/kos): an enemy who kills a member is added, with level\n" ..
+			"   and layer (layer S) on NEW kills only, for one hour. A name\n" ..
+			"   is NOT a bounty. Rows stay still.\n" ..
+			"   Only the guild master or Valar can delete.\n\n" ..
+			"2. START: right-click his name (or /kos fund <name>). One 1g\n" ..
+			"   bounty is LIVE at once - no bank deposit, no waiting.\n\n" ..
+			"3. OWED: the requester owes the 1g to the guild bank. /kos owed,\n" ..
+			"   the Ledger tab and Officers button show it. /kos paidup <name>\n" ..
+			"   clears the debt; Officers posts the owed line to chat.\n\n" ..
+			"4. KILL: the bank keeps 30% (30s). The hunter's 70% (70s) joins\n" ..
+			"   one prize pool - it is not paid at the kill. swap to layer\n" ..
+			"   whispers the victim for an invite.\n\n" ..
+			"5. PRIZE: at month end the top hunter (most completed bounties)\n" ..
+			"   wins the pool. An officer pays by hand; the addon never moves gold.\n\n" ..
+			"6. REFUND: after 7 days unclaimed, 1g goes back to the requester.\n\n" ..
+			"7. DELETES: a delete is final. Add the name again by hand to\n" ..
+			"   bring it back. No sync can undo it.\n\n" ..
+			"/kos opens the board. Prev/Next page. Pins last 30 minutes.")
 		welcome.body = body
 
 		local check = CreateFrame("CheckButton", nil, welcome, "UICheckButtonTemplate")
@@ -2734,6 +3532,11 @@ local function ShowWelcome()
 		welcome.check, welcome.ack = check, ack
 		check:SetChecked(false)
 	end
+	if force and welcome.check then
+		-- A preview must look like the first run, even on an account that ticked it.
+		welcome.check:SetChecked(false)
+		welcome.ack:Disable()
+	end
 	welcome:Show()
 end
 
@@ -2750,17 +3553,82 @@ end
 
 local refresh
 
+-- Kept on ns rather than a new main-chunk local: this file is at Lua 5.1's 200-local ceiling.
+-- Old rows saved before killAt existed carry killAt = 0. Zero is truthy in Lua, so the old
+-- "killAt or at" fallback never ran and those rows sorted alphabetically instead of by kill time.
+ns.KillTime = function(e)
+	local t = tonumber(e and e.killAt) or 0
+	if t <= 0 then t = tonumber(e and e.at) or 0 end
+	return t
+end
+
+ns.EntryCompare = function(a, b)
+	-- The board reads newest kill first, on every page: first page newest, last page oldest.
+	-- Bounty state no longer outranks time, and a sync arriving late does not move a name up.
+	local aa, bb = ns.KillTime(a), ns.KillTime(b)
+	if aa ~= bb then return aa > bb end
+	return (a.name or "") < (b.name or "")
+end
+
 local function SortedEntries()
 	local list = {}
 	for _, e in pairs(Store().entries) do list[#list + 1] = e end
-	table.sort(list, function(a, b)
-		local sa, sb = StateOf(a), StateOf(b)
-		local rank = { live = 0, claimed = 1, refunddue = 2, partly = 3, pending = 4, unfunded = 5, paid = 6, refunded = 7 }
-		if (rank[sa] or 9) ~= (rank[sb] or 9) then return (rank[sa] or 9) < (rank[sb] or 9) end
-		local aa, bb = tonumber(a.at) or 0, tonumber(b.at) or 0
-		if aa ~= bb then return aa > bb end
-		return (a.name or "") < (b.name or "")
-	end)
+	table.sort(list, ns.EntryCompare)
+	return list
+end
+
+-- The board's row order is frozen while the window is open: a sync changing money or state must
+-- not make names jump. A REAL new kill is different - it belongs at the top, newest first. Track
+-- the kill time each row had when the order was frozen; if it changed, that row is re-inserted at
+-- the front in kill-time order. Rows whose kill time did not change keep their exact old position.
+ns.FreezeBoardOrder = function()
+	ui.order, ui.orderFresh, ui.orderKill = {}, true, {}
+	for i, e in ipairs(SortedEntries()) do
+		ui.order[i] = e.guid
+		ui.orderKill[e.guid] = ns.KillTime(e)
+	end
+end
+
+local function BoardList()
+	local entries = Store().entries
+	if type(ui.order) ~= "table" then ns.FreezeBoardOrder() end
+	if type(ui.orderKill) ~= "table" then ui.orderKill = {} end
+	local fresh = {}
+	for _, e in pairs(entries) do
+		if ui.orderKill[e.guid] ~= ns.KillTime(e) then fresh[#fresh + 1] = e end
+	end
+	if #fresh > 0 then
+		table.sort(fresh, ns.EntryCompare)
+		local at = 1
+		for i = 1, #fresh do
+			local guid = fresh[i].guid
+			for j = 1, #ui.order do
+				if ui.order[j] == guid then table.remove(ui.order, j) break end
+			end
+			table.insert(ui.order, at, guid)
+			at = at + 1
+		end
+		ui.offset = 0 -- the new kill must be on screen, not hidden on another page
+	end
+	local list, seen = {}, {}
+	for i = 1, #ui.order do
+		local e = entries[ui.order[i]]
+		if e then
+			list[#list + 1] = e
+			seen[e.guid] = true
+			ui.orderKill[e.guid] = ns.KillTime(e)
+		end
+	end
+	local extras = {}
+	for _, e in pairs(entries) do if not seen[e.guid] then extras[#extras + 1] = e end end
+	if #extras > 0 then
+		table.sort(extras, ns.EntryCompare)
+		for i = 1, #extras do
+			list[#list + 1] = extras[i]
+			ui.order[#ui.order + 1] = extras[i].guid
+			ui.orderKill[extras[i].guid] = ns.KillTime(extras[i])
+		end
+	end
 	return list
 end
 
@@ -2798,9 +3666,6 @@ local function RefreshDeaths()
 			elseif (tonumber(e.funded) or 0) > 0 then
 				row.bounty:SetText(Money(e.funded))
 				row.bounty:SetTextColor(0.95, 0.80, 0.30)
-			elseif StateOf(e) == "pending" then
-				row.bounty:SetText("pending job")
-				row.bounty:SetTextColor(0.95, 0.75, 0.30)
 			else
 				row.bounty:SetText(StateText(e))
 				row.bounty:SetTextColor(0.62, 0.50, 0.36)
@@ -2828,34 +3693,58 @@ refresh = function()
 		if ui.refreshBoard then ui.refreshBoard() end
 		return
 	end
-	local list = SortedEntries()
+	if ui.tab == "ledger" then
+		if ui.refreshLedger then ui.refreshLedger() end
+		return
+	end
+	local list = BoardList()
 	if not ui.selected or not ui.selected.guid or not Entry(ui.selected.guid) then ui.selected = list[1] end
-	if ui.offset > math.max(0, #list - ROWS) then ui.offset = math.max(0, #list - ROWS) end
-	local funded, want, pending = 0, 0, 0
+	-- Only a fresh freeze may correct the page. A sync must leave the visible row and page alone.
+	if ui.orderFresh then
+		if ui.offset > math.max(0, #list - ROWS) then ui.offset = math.max(0, #list - ROWS) end
+		ui.orderFresh = nil
+	end
+	local funded, want, live = 0, 0, 0
 	for _, e in pairs(Store().entries) do
 		if not e.paid and not e.refunded then
 			funded = funded + (tonumber(e.funded) or 0)
 			want = want + (tonumber(e.want) or 0)
-			if StateOf(e) == "pending" then pending = pending + 1 end
+			if StateOf(e) == "live" or StateOf(e) == "claimed" then live = live + 1 end
 		end
 	end
-	ui.subtitle:SetText(("%d on the list   -   %s funded   -   %s still needed%s"):format(
-		#list, Money(funded), Money(math.max(0, want - funded)),
-		pending > 0 and ("   -   %d pending job%s"):format(pending, pending == 1 and "" or "s") or ""))
+	ui.subtitle:SetText(("%d names  -  %s live  -  %d live"):format(#list, Money(funded), live))
 	local s = Store()
-	ui.ledger:SetText(("escrowed %s   -   prize paid %s   -   bank cut %s   -   pooled %s   -   back %s"):format(
-		Money(s.bank.escrowed), Money(s.bank.paid), Money(s.bank.cut),
-		Money(s.bank.pool), Money(s.bank.refunded)))
-	local debts = Debts()
-	if #debts > 0 then
-		ui.owed:SetText(("|cffffd100the bank still owes %s|r   -   %d payment%s nobody has handed over yet"):format(
-			Money(OwedTotal(debts)), #debts, #debts == 1 and "" or "s"))
-		ui.owed:Show()
-	else
-		ui.owed:SetText("|cff7f7f7fthe bank owes nothing: every bounty is either open or settled|r")
-		ui.owed:Show()
+	ui.ledger:SetText(("bank keeps %s   -   prize paid out %s   -   prize pool %s   -   refunded %s"):format(
+		Money(s.bank.cut), Money(s.bank.paid), Money(s.bank.pool), Money(s.bank.refunded)))
+	local debts, ious = Debts(), Ious()
+	local parts = {}
+	if #ious > 0 then
+		-- Name the people, not just a total. This is the "who owes what" ledger in the window.
+		local names = {}
+		for i = 1, #ious do
+			if #names < 4 then
+				names[#names + 1] = ("%s %s"):format(ious[i].name or "?", Money(ious[i].amount))
+			end
+		end
+		if #ious > #names then names[#names + 1] = ("+%d more"):format(#ious - #names) end
+		parts[#parts + 1] = ("|cffffd100members owe: %s|r"):format(table.concat(names, ", "))
 	end
-	Toggle(ui.officers, #debts > 0)
+	if #debts > 0 then
+		local names = {}
+		for i = 1, math.min(#debts, 3) do
+			local d = debts[i]
+			names[#names + 1] = ("%s to %s"):format(Money(d.amount), d.to or "?")
+		end
+		if #debts > #names then names[#names + 1] = ("+%d more"):format(#debts - #names) end
+		parts[#parts + 1] = ("bank owes: %s"):format(table.concat(names, ", "))
+	end
+	if #parts > 0 then
+		ui.owed:SetText(table.concat(parts, "   -   ") .. "   -   /kos owed")
+	else
+		ui.owed:SetText("|cff7f7f7fnobody owes anything: every bounty is either open or settled|r")
+	end
+	ui.owed:Show()
+	Toggle(ui.officers, #debts > 0 or #ious > 0)
 	for i = 1, ROWS do
 		local row = ui.rows[i]
 		local e = list[ui.offset + i]
@@ -2868,7 +3757,8 @@ refresh = function()
 				(tonumber(e.funded) or 0) > 0 and 0.80 or 0.38, 0.30)
 			row.kills:SetText(tostring(tonumber(e.kills) or 0))
 			local state = StateOf(e)
-			row.state:SetText(StateText(e))
+			local tag = ns.KillerTag(e)
+			row.state:SetText(StateText(e) .. (tag and ("  " .. tag) or ""))
 			if state == "live" then row.state:SetTextColor(0.95, 0.80, 0.30)
 			elseif state == "claimed" then row.state:SetTextColor(0.88, 0.62, 0.24)
 			elseif state == "refunddue" then row.state:SetTextColor(0.90, 0.45, 0.30)
@@ -2881,10 +3771,11 @@ refresh = function()
 		end
 	end
 	local e = ui.selected
-	local whereLine = SpotLine(e)
+	local place, near = ns.SpotPlace(e)
 	ui.spot:SetText(("LAST KNOWN LOCATION: %s"):format(
-		whereLine or (e and "unavailable - no readable map point; /kos where shows what the client gave"
-			or "select an enemy above")))
+		place and ((near and "near " or "") .. place)
+			or (e and "unavailable - no readable map point; /kos where shows what the client gave"
+				or "select an enemy above")))
 	if e then
 		local state = StateOf(e)
 		local cash = tonumber(e.funded) or 0
@@ -2892,12 +3783,13 @@ refresh = function()
 		if state == "refunddue" then
 			money = ("%s is going back to %s - it is still in the bank"):format(Money(cash), e.refundedTo)
 		elseif cash > 0 then
-			money = ("%s funded by %s - %s goes into this month's prize pool, bank keeps %s"):format(
+			money = ("%s live, asked for by %s (%s) - %s joins the prize pool, bank keeps %s"):format(
 				Money(cash), e.fundedBy ~= "" and e.fundedBy or "?",
+				e.paidUp and "paid up" or "OWES THE BANK",
 				Money(PayoutOf(cash)), Money(CutOf(cash)))
 		else
-			money = ("no bounty funded - %s has to go into the guild bank first"):format(
-				Money(math.max(0, (tonumber(e.want) or 0) - cash)))
+			money = ("no bounty requested - /kos fund puts up a live %s bounty"):format(
+				Money(DEFAULT_REWARD))
 		end
 		local who
 		if e.paid then who = ("70%% pooled for %s"):format(e.paidTo ~= "" and e.paidTo or "?")
@@ -2921,11 +3813,18 @@ refresh = function()
 				and ("  -  back to %s in %s"):format(e.fundedBy ~= "" and e.fundedBy or "the payer", Left(left))
 				or "  -  refund is due"
 		end
-		local spotLine = SpotLine(e)
-		ui.detail:SetText(("%s\n%s%s\n%s%s%s"):format(
-			Clean(e.reason or "", MAX_REASON),
-			victims ~= "" and (victims .. "\n") or "", money, who, expiry,
-			spotLine and ("\nlast known location: " .. spotLine) or ""))
+		local knownLine = ns.KnownSpot(e)
+		local info = ns.KillerLine(e)
+		-- Killer info goes first. The last-known location can wrap for two lines; when it came
+		-- after everything else it pushed this line out of the 9-line detail panel.
+		local lines = {}
+		if info then lines[#lines + 1] = "killer: " .. info end
+		lines[#lines + 1] = Clean(e.reason or "", MAX_REASON)
+		if victims ~= "" then lines[#lines + 1] = victims end
+		lines[#lines + 1] = money .. who .. expiry
+		if e.spot then lines[#lines + 1] = knownLine end
+		ui.detail:SetText(table.concat(lines, "\n"))
+		Toggle(ui.swapLayer, ns.LayerFresh(e) ~= nil)
 		local claimed = e.claims and #e.claims > 0
 		local manage = Board.CanManage()
 		Toggle(ui.fund, not e.paid and not e.refundDue and not claimed)
@@ -2934,10 +3833,11 @@ refresh = function()
 		Toggle(ui.refund, manage and (e.refundDue or (cash > 0 and not e.paid and not e.refunded and not claimed)))
 		Toggle(ui.announce, not e.paid and not e.refunded)
 		Toggle(ui.delete, manage)
+		Toggle(ui.paidup, manage and #ious > 0)
 	else
 		ui.detail:SetText("nobody on the board yet.\nthe next enemy who kills a guild member appears here.")
 		ui.refund:SetText("Refund")
-		for _, b in ipairs({ ui.fund, ui.paid, ui.refund, ui.announce, ui.delete }) do Toggle(b, false) end
+		for _, b in ipairs({ ui.fund, ui.paid, ui.refund, ui.announce, ui.delete, ui.paidup }) do Toggle(b, false) end
 	end
 	ui.offsetText:SetText(#list == 0 and "" or ("%d-%d of %d"):format(
 		ui.offset + 1, math.min(#list, ui.offset + ROWS), #list))
@@ -2945,31 +3845,24 @@ refresh = function()
 end
 
 -- A settled bounty does not pay twice. Reopening it clears the old payout/refund so the same name
--- can start a fresh pending job; the bank ledger keeps the money that was already handled.
+-- can be requested again; the bank ledger keeps the money that was already handled.
 local function ReopenEntry(e)
 	if not e or not (e.paid or e.refunded) then return false end
-	e.paid, e.refunded = false, nil
+	e.paid, e.refunded, e.refundDue = false, nil, nil
 	e.funded, e.fundedBy, e.fundedAt = 0, nil, nil
+	e.paidUp = false
 	e.paidTo, e.paidAt, e.refundedTo, e.refundedAt = nil, nil, nil, nil
 	e.claims = {}
 	e.want = math.max(tonumber(e.want) or 0, tonumber(DB().defaultReward) or 0)
-	e.job = false
 	Bump(e)
 	Broadcast(e, false)
 	return true
 end
 
 local function FocusEntry(e)
+	-- Selecting a name must never move the list. Only the Prev/Next buttons change ui.offset.
 	ui.selected = e
 	if not ui.frame then return end
-	local list = SortedEntries()
-	for i = 1, #list do
-		if list[i] == e then
-			if i > ui.offset + ROWS then ui.offset = i - ROWS end
-			if i <= ui.offset then ui.offset = math.max(0, i - 1) end
-			break
-		end
-	end
 	refresh()
 end
 
@@ -2981,7 +3874,8 @@ local function PrepareDeathKiller(d)
 	local e = Entry(guid)
 	if not e then
 		e = AddKill(guid, d.kname, d.kclass, "history",
-			("killed %s"):format(d.vname ~= "" and d.vname or "a guild member"), d.spot)
+			("killed %s"):format(d.vname ~= "" and d.vname or "a guild member"),
+			d.spot, d.klevel, d.klayer)
 		if not e then return nil, "the board refused him" end
 		-- AddKill records the clicker as the victim; the death row knows who it really was.
 		e.victims = {}
@@ -2994,35 +3888,38 @@ local function PrepareDeathKiller(d)
 	return e, reopened
 end
 
--- Left-click a killer: select him. Right-click: same selection plus an instant pending bounty job.
+-- Left-click a killer: select him. Right-click: same selection plus a live 1g bounty.
 function ns.SelectKiller(d, speak)
 	local e, reopened = PrepareDeathKiller(d)
 	if not e then return false, reopened end
+	ns.FillKillerInfo(e)
 	if speak ~= false and DB().notices ~= false then
 		local line
 		if reopened then
 			line = "the old bounty is settled - this starts a new one"
 		elseif (tonumber(e.funded) or 0) > 0 then
-			line = ("already has %s funded"):format(Money(e.funded))
+			line = ("already has a live %s bounty"):format(Money(e.funded))
 		else
-			line = ("no bounty funded yet - %s is what one asks for"):format(
+			line = ("no bounty yet - one asks for %s"):format(
 				Money(math.max(0, (tonumber(e.want) or 0) - (tonumber(e.funded) or 0))))
 		end
-		Say("%s%s|r selected - %s. |cffffd100Right-click|r him to start a pending bounty job, then deposit the gold into the guild bank; the bounty is published when the bank's gold shows it.",
-			ClassColor(e), e.name, line)
+		local info = ns.KillerLine(e) or ns.KillerLine(d)
+		Say("%s%s|r selected - %s%s. |cffffd100Right-click|r him to put up a live bounty; the gold is owed to the bank and a manager clears it with /kos paidup.",
+			ClassColor(e), e.name, line, info and (" (" .. info .. ")") or "")
 	end
 	return true, e
 end
 
--- Right-click a name on either list (or /kos bounty <name>): the job exists at once and is shared,
--- but it only becomes a live bounty when the bank balance proves the deposit.
+-- Right-click a name on either list (or /kos bounty <name>): the bounty is live at once, shared with
+-- the guild, and the requester owes 1g until a manager marks him paid up.
 function ns.StartBounty(entry, speak)
 	if not entry then return false, "no entry" end
+	ns.FillKillerInfo(entry)
 	local reopened = ReopenEntry(entry)
 	FocusEntry(entry)
 	local ok, why, need = StartJob(entry, speak)
 	if ok and reopened and speak ~= false and DB().notices ~= false then
-		Say("the old bounty is settled - this is a new pending job.")
+		Say("the old bounty is settled - this is a new live bounty.")
 	end
 	return ok, why, need
 end
@@ -3038,12 +3935,9 @@ local function BuildWindow()
 	local f = MakeWindow("KillOnSightFrame", 540, 760, "DIALOG")
 	Dress(f, "Kill on Sight", MEDIA .. "emblem")
 	ui.frame = f
-	f:SetScript("OnShow", function() refresh() end)
-	f:SetScript("OnMouseWheel", function(self, delta)
-		ui.offset = math.max(0, ui.offset - (delta > 0 and 1 or -1))
-		refresh()
-	end)
-	f:EnableMouseWheel(true)
+	f:SetScript("OnShow", function() ui.order, ui.offset = nil, 0 refresh() end)
+	-- The wheel belongs to the board list only. On the whole window a stray wheel move over the
+	-- ledger, buttons or detail panel scrolled the board by itself.
 
 	-- The rule of the whole addon, in the window where everybody can read it, every time it opens.
 	ui.blurb = f:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
@@ -3054,47 +3948,63 @@ local function BuildWindow()
 	ui.blurb:SetJustifyV("TOP")
 	ui.blurb:SetWordWrap(true)
 	ui.blurb:SetText("An enemy who kills a guild member is added here.\n" ..
-		"|cffffd100No guild-bank deposit, no bounty - don't hunt until funded.|r")
+		"|cffffd100Right-click puts up a live 1g bounty; the requester owes it until /kos paidup.|r")
 
 	ui.subtitle = f:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 	-- Sits to the right of the tab strip, so neither has to move the board panels down.
-	ui.subtitle:SetPoint("TOPLEFT", 232, -64)
-	ui.subtitle:SetWidth(288)
+	ui.subtitle:SetPoint("TOPLEFT", 288, -64)
+	ui.subtitle:SetWidth(232)
 	ui.subtitle:SetJustifyH("LEFT")
 	ui.subtitle:SetWordWrap(false)
 	ui.subtitle:SetTextColor(0.79, 0.58, 0.34)
 
-	-- Two tabs along the top of the window. The board is the default; "Hunter Board" swaps in the
-	-- monthly leaderboard below. SetTab is filled in once every widget exists.
+	-- Three tabs along the top of the window. The board is the default; "Hunter Board" swaps in the
+	-- monthly leaderboard, "Ledger" swaps in the who-owes-what list. SetTab is filled in once every
+	-- widget exists.
 	local SetTab
 	ui.tab = "board"
 	local tabBoard = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-	tabBoard:SetSize(100, 20)
+	tabBoard:SetSize(72, 20)
 	tabBoard:SetPoint("TOPLEFT", 18, -60)
 	tabBoard:SetText("Board")
 	tabBoard:SetScript("OnClick", function() SetTab("board") end)
 	local tabHunters = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-	tabHunters:SetSize(100, 20)
-	tabHunters:SetPoint("TOPLEFT", 122, -60)
+	tabHunters:SetSize(106, 20)
+	tabHunters:SetPoint("TOPLEFT", 94, -60)
 	tabHunters:SetText("Hunter Board")
 	tabHunters:SetScript("OnClick", function() SetTab("leader") end)
-	ui.tabBoard, ui.tabHunters = tabBoard, tabHunters
+	local tabLedger = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+	tabLedger:SetSize(76, 20)
+	tabLedger:SetPoint("TOPLEFT", 204, -60)
+	tabLedger:SetText("Ledger")
+	tabLedger:SetScript("OnClick", function() SetTab("ledger") end)
+	ui.tabBoard, ui.tabHunters, ui.tabLedger = tabBoard, tabHunters, tabLedger
 
 	local listBox = Inset(f, 18, -80, -18, 428)
 	ui.listBox = listBox
+	-- No mouse-wheel handler at all: a stray wheel move anywhere in the window used to scroll the
+	-- board. Use the Prev/Next buttons at the foot of the list instead.
 	for _, h in ipairs({ { 0, "ENEMY" }, { 176, "BOUNTY" }, { 252, "KILLS" }, { 306, "STATE" } }) do
 		local fs = listBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 		fs:SetPoint("TOPLEFT", 12 + h[1], -8)
 		fs:SetText(h[2])
 		fs:SetTextColor(0.79, 0.55, 0.29)
 	end
-	-- The enemy list is the first thing people look at, so the last known spot lives at its foot,
-	-- separate from the money and the buttons. It is never hidden just because no bounty exists.
+	-- The enemy list is the first thing people look at. Its last-known-location
+	-- line gets its own two-line strip below a separator, clear of the rows that
+	-- change as the board scrolls and clear of the pager controls below that.
+	ui.spotRule = listBox:CreateTexture(nil, "OVERLAY")
+	ui.spotRule:SetPoint("TOPLEFT", 10, -206)
+	ui.spotRule:SetSize(468, 1)
+	ui.spotRule:SetColorTexture(0.45, 0.30, 0.16, 0.65)
 	ui.spot = listBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	ui.spot:SetPoint("BOTTOMLEFT", 12, 8)
+	ui.spot:SetPoint("BOTTOMLEFT", 12, 22)
 	ui.spot:SetWidth(448)
+	ui.spot:SetHeight(22)
 	ui.spot:SetJustifyH("LEFT")
+	ui.spot:SetJustifyV("TOP")
 	ui.spot:SetWordWrap(true)
+	ui.spot:SetMaxLines(2)
 	ui.spot:SetTextColor(1, 0.82, 0.25)
 	ui.spot:SetText("LAST KNOWN LOCATION: select an enemy above")
 
@@ -3111,19 +4021,19 @@ local function BuildWindow()
 		hl:SetColorTexture(1, 0.82, 0, 0.12)
 		row.name = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 		row.name:SetPoint("LEFT", 2, 0)
-		row.name:SetWidth(168)
+		row.name:SetWidth(150)
 		row.name:SetJustifyH("LEFT")
 		row.reward = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-		row.reward:SetPoint("LEFT", 178, 0)
-		row.reward:SetWidth(70)
+		row.reward:SetPoint("LEFT", 158, 0)
+		row.reward:SetWidth(60)
 		row.reward:SetJustifyH("LEFT")
 		row.kills = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-		row.kills:SetPoint("LEFT", 254, 0)
-		row.kills:SetWidth(44)
+		row.kills:SetPoint("LEFT", 224, 0)
+		row.kills:SetWidth(40)
 		row.kills:SetJustifyH("LEFT")
 		row.state = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-		row.state:SetPoint("LEFT", 308, 0)
-		row.state:SetWidth(150)
+		row.state:SetPoint("LEFT", 270, 0)
+		row.state:SetWidth(196)
 		row.state:SetJustifyH("LEFT")
 		row:SetScript("OnClick", function(self, button)
 			if not self.entry then return end
@@ -3139,21 +4049,24 @@ local function BuildWindow()
 
 	local pager = CreateFrame("Button", nil, listBox, "UIPanelButtonTemplate")
 	pager:SetSize(22, 16)
-	pager:SetPoint("BOTTOMLEFT", 6, 5)
+	pager:SetPoint("BOTTOMLEFT", 6, 4)
 	pager:SetText("<")
 	pager:SetScript("OnClick", function() ui.offset = math.max(0, ui.offset - ROWS) refresh() end)
 	local pager2 = CreateFrame("Button", nil, listBox, "UIPanelButtonTemplate")
 	pager2:SetSize(22, 16)
-	pager2:SetPoint("BOTTOMRIGHT", -6, 5)
+	pager2:SetPoint("BOTTOMRIGHT", -6, 4)
 	pager2:SetText(">")
 	pager2:SetScript("OnClick", function() ui.offset = ui.offset + ROWS refresh() end)
+	ui.pagePrev, ui.pageNext = pager, pager2
 	ui.offsetText = listBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	ui.offsetText:SetPoint("BOTTOM", 0, 6)
+	ui.offsetText:SetPoint("BOTTOM", 0, 5)
 	ui.offsetText:SetTextColor(0.55, 0.47, 0.36)
 
 	-- The guild death feed: who killed whom, when, and what the board says about the killer. Every
 	-- name in it is a way into the bounty flow: left-click selects, right-click starts the job.
-	local deathBox = Inset(f, 18, -340, -18, 296)
+	-- 148 tall: five 18 px rows, a separator, then a measured two-line hint strip. The old
+	-- 20 px rows let the wrapped hint sit on top of the last row.
+	local deathBox = Inset(f, 18, -340, -18, 272)
 	ui.deathBox = deathBox
 	ui.feedTitle = deathBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
 	ui.feedTitle:SetPoint("TOPLEFT", 12, -7)
@@ -3193,7 +4106,7 @@ local function BuildWindow()
 		-- Same as the board rows: register the right button or the client never fires OnClick for it.
 		row:RegisterForClicks("LeftButtonUp", "RightButtonUp")
 		row:SetSize(468, rowHeight)
-		row:SetPoint("TOPLEFT", 10, -22 - (i - 1) * rowHeight)
+		row:SetPoint("TOPLEFT", 10, -20 - (i - 1) * rowHeight)
 		local hl = row:CreateTexture(nil, "HIGHLIGHT")
 		hl:SetAllPoints(row)
 		hl:SetColorTexture(1, 0.82, 0, 0.12)
@@ -3229,6 +4142,8 @@ local function BuildWindow()
 			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
 			GameTooltip:AddLine(Clean(d.kname, MAX_NAME) .. " killed " ..
 				(Clean(d.vname, MAX_NAME) ~= "" and Clean(d.vname, MAX_NAME) or "?"), 1, 0.82, 0)
+			local info = ns.KillerLine(d)
+			if info then GameTooltip:AddLine("killer: " .. info, 1, 0.82, 0.4) end
 			GameTooltip:AddLine(SpotLine(d) or "last known location unavailable", 1, 1, 1, true)
 			GameTooltip:Show()
 		end)
@@ -3237,26 +4152,48 @@ local function BuildWindow()
 		end)
 		ui.deaths[i] = row
 	end
+	ui.feedRule = deathBox:CreateTexture(nil, "OVERLAY")
+	ui.feedRule:SetPoint("TOPLEFT", 10, -114)
+	ui.feedRule:SetSize(468, 1)
+	ui.feedRule:SetColorTexture(0.45, 0.30, 0.16, 0.65)
 	ui.feedHint = deathBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	ui.feedHint:SetPoint("BOTTOMLEFT", 10, 5)
+	ui.feedHint:SetPoint("BOTTOMLEFT", 10, 4)
 	ui.feedHint:SetWidth(448)
+	ui.feedHint:SetHeight(26)
 	ui.feedHint:SetJustifyH("LEFT")
+	ui.feedHint:SetJustifyV("TOP")
+	ui.feedHint:SetWordWrap(true)
+	ui.feedHint:SetMaxLines(2)
 	ui.feedHint:SetTextColor(0.55, 0.47, 0.36)
-	ui.feedHint:SetText("left-click selects  -  right-click starts a pending bounty job (it pays only after the guild-bank deposit)")
+	ui.feedHint:SetText("left-click selects  -  right-click puts up a live 1g bounty (the requester owes it until /kos paidup)")
 
 	ui.ledger = f:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
 	ui.ledger:SetPoint("BOTTOM", 0, 108)
 	ui.ledger:SetTextColor(0.55, 0.47, 0.36)
 
-	local detailBox = Inset(f, 18, -472, -18, 152)
+	-- Moved down with the death feed: still 136 tall, and 8 px clear of the ledger.
+	local detailBox = Inset(f, 18, -496, -18, 128)
 	ui.detailBox = detailBox
 	ui.detail = detailBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 	ui.detail:SetPoint("TOPLEFT", 12, -10)
-	ui.detail:SetWidth(452)
+	ui.detail:SetWidth(336)
 	ui.detail:SetHeight(124)
 	ui.detail:SetJustifyH("LEFT")
 	ui.detail:SetJustifyV("TOP")
+	ui.detail:SetWordWrap(true)
+	ui.detail:SetMaxLines(9)
 	ui.detail:SetTextColor(0.94, 0.90, 0.84)
+
+	-- Sits on the killer line, right after the level and layer. Enabled only while that layer is
+	-- still fresh, so an old kill never offers a swap the addon itself refuses to make.
+	ui.swapLayer = CreateFrame("Button", nil, detailBox, "UIPanelButtonTemplate")
+	ui.swapLayer:SetSize(108, 22)
+	ui.swapLayer:SetPoint("TOPRIGHT", -10, -7)
+	ui.swapLayer:SetText("swap to layer")
+	ui.swapLayer:SetScript("OnClick", function()
+		local e = ui.selected
+		if e then ns.SwapToLayer(e) end
+	end)
 
 	ui.owed = f:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 	ui.owed:SetPoint("BOTTOM", 0, 80)
@@ -3274,13 +4211,8 @@ local function BuildWindow()
 	ui.fund = button("Fund", 98, 74, 46, function()
 		local e = ui.selected
 		if not e then return end
-		local ok, why = Fund(e)
-		if ok then
-			Say("deposit %s into the guild bank now. The bounty is published the moment the bank's gold shows it.",
-				Money(why))
-		else
-			Say("%s", tostring(why))
-		end
+		local ok, _, why = StartJob(e, true)
+		if not ok then Say("%s", tostring(why)) end
 	end)
 	ui.paid = button("Pool", 178, 74, 46, function()
 		Say("each hunter's 70%% goes into this month's single prize pool. " ..
@@ -3297,9 +4229,32 @@ local function BuildWindow()
 	end)
 	ui.announce = button("Announce", 338, 96, 46, function()
 		local e = ui.selected
-		if e then Announce(e) end
+		if e then
+			ns.FillKillerInfo(e) -- read a visible level/layer now, just like /kos announce does
+			Announce(e)
+		end
 	end)
 	ui.officers = button("Officers", 440, 82, 46, function() PostOwed() end)
+	ui.paidup = button("Mark paid", 294, 78, 18, function()
+		local e = ui.selected
+		local who = e and e.fundedBy or ""
+		if who == "" then
+			Say("select a bounty with a requester first - Mark paid means the requester already handed the bank the 1g; GM/Valar only.")
+			return
+		end
+		local ok, why = PaidUp(who, MyName())
+		if not ok then Say("%s", tostring(why)) end
+	end)
+	ui.paidup:SetScript("OnEnter", function(self)
+		if not GameTooltip then return end
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:AddLine("Mark paid up", 1, 0.82, 0.4)
+		GameTooltip:AddLine("Use only after the requester has handed the 1g to the guild bank.", 1, 1, 1, true)
+		GameTooltip:AddLine("This clears their debt in the Ledger. The addon does not read or move gold.", 0.94, 0.90, 0.84, true)
+		GameTooltip:AddLine("GM or Valar only. /kos paidup <name> does the same.", 0.79, 0.58, 0.33, true)
+		GameTooltip:Show()
+	end)
+	ui.paidup:SetScript("OnLeave", function() if GameTooltip then GameTooltip:Hide() end end)
 	ui.sync = button("Sync", 378, 64, 18, function()
 		SendDigest(true)
 		QueueParts("Q", true)
@@ -3443,18 +4398,137 @@ local function BuildWindow()
 			or "")
 	end
 
+	-- The Ledger tab: a real list of who owes what, including debts already cleared. Plain frame
+	-- with the same bronze fill as the insets, so the board tab still has exactly three insets.
+	local ledgerBox = CreateFrame("Frame", nil, f)
+	ledgerBox:SetPoint("TOPLEFT", 18, -80)
+	ledgerBox:SetPoint("BOTTOMRIGHT", -18, 40)
+	local df = ledgerBox:CreateTexture(nil, "BACKGROUND", nil, 2)
+	df:SetAllPoints(ledgerBox)
+	if not (HasAtlas(INSET_ART) and pcall(df.SetAtlas, df, INSET_ART)) then
+		df:SetColorTexture(INSET_FILL[1], INSET_FILL[2], INSET_FILL[3], INSET_FILL[4])
+	end
+	ui.ledgerBox = ledgerBox
+
+	ui.ledgerTitle = ledgerBox:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+	ui.ledgerTitle:SetPoint("TOPLEFT", 12, -10)
+	ui.ledgerTitle:SetWidth(470)
+	ui.ledgerTitle:SetJustifyH("LEFT")
+	ui.ledgerTitle:SetTextColor(1, 0.82, 0.25)
+	ui.ledgerTitle:SetText("Debts ledger")
+
+	ui.ledgerSub = ledgerBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	ui.ledgerSub:SetPoint("TOPLEFT", 12, -32)
+	ui.ledgerSub:SetWidth(470)
+	ui.ledgerSub:SetJustifyH("LEFT")
+	ui.ledgerSub:SetTextColor(0.79, 0.55, 0.29)
+	ui.ledgerSub:SetText("Paid up = the requester handed the bank the 1g; GM/Valar mark it here")
+
+	for _, h in ipairs({ { 2, "WHO" }, { 134, "GOLD" }, { 198, "FOR" }, { 310, "WHEN" }, { 378, "STATUS" } }) do
+		local fs = ledgerBox:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+		fs:SetPoint("TOPLEFT", 12 + h[1], -54)
+		fs:SetText(h[2])
+		fs:SetTextColor(0.79, 0.55, 0.29)
+	end
+
+	ui.ledgerRows, ui.ledgerOffset = {}, 0
+	for i = 1, 14 do
+		local row = CreateFrame("Frame", nil, ledgerBox)
+		row:SetSize(468, 20)
+		row:SetPoint("TOPLEFT", 10, -72 - (i - 1) * 20)
+		row.who = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		row.who:SetPoint("LEFT", 2, 0) row.who:SetWidth(128) row.who:SetJustifyH("LEFT")
+		row.gold = row:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		row.gold:SetPoint("LEFT", 134, 0) row.gold:SetWidth(60) row.gold:SetJustifyH("LEFT")
+		row.target = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		row.target:SetPoint("LEFT", 198, 0) row.target:SetWidth(108) row.target:SetJustifyH("LEFT")
+		row.when = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		row.when:SetPoint("LEFT", 310, 0) row.when:SetWidth(62) row.when:SetJustifyH("LEFT")
+		row.status = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		row.status:SetPoint("LEFT", 378, 0) row.status:SetWidth(90) row.status:SetJustifyH("LEFT")
+		ui.ledgerRows[i] = row
+	end
+
+	ui.ledgerTotal = ledgerBox:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	ui.ledgerTotal:SetPoint("BOTTOMLEFT", 12, 12)
+	ui.ledgerTotal:SetWidth(320)
+	ui.ledgerTotal:SetJustifyH("LEFT")
+	ui.ledgerTotal:SetTextColor(0.94, 0.90, 0.84)
+
+	local ledgerPrev = CreateFrame("Button", nil, ledgerBox, "UIPanelButtonTemplate")
+	ledgerPrev:SetSize(56, 22)
+	ledgerPrev:SetPoint("BOTTOMRIGHT", -76, 8)
+	ledgerPrev:SetText("Prev")
+	ledgerPrev:SetScript("OnClick", function()
+		ui.ledgerOffset = math.max(0, ui.ledgerOffset - #ui.ledgerRows)
+		ui.refreshLedger()
+	end)
+	local ledgerNext = CreateFrame("Button", nil, ledgerBox, "UIPanelButtonTemplate")
+	ledgerNext:SetSize(56, 22)
+	ledgerNext:SetPoint("BOTTOMRIGHT", -12, 8)
+	ledgerNext:SetText("Next")
+	ledgerNext:SetScript("OnClick", function()
+		ui.ledgerOffset = ui.ledgerOffset + #ui.ledgerRows
+		ui.refreshLedger()
+	end)
+	ui.ledgerPagePrev, ui.ledgerPageNext = ledgerPrev, ledgerNext
+
+	ui.refreshLedger = function()
+		local rows = LedgerRows()
+		if ui.ledgerFresh then
+			if ui.ledgerOffset > math.max(0, #rows - #ui.ledgerRows) then
+				ui.ledgerOffset = math.max(0, #rows - #ui.ledgerRows)
+			end
+			ui.ledgerFresh = nil
+		end
+		local open, closed = 0, 0
+		for i = 1, #rows do
+			if rows[i].status == "owes bank" or rows[i].status == "refund due" then
+				open = open + rows[i].amount
+			else
+				closed = closed + rows[i].amount
+			end
+		end
+		ui.ledgerTotal:SetText(("outstanding %s   -   settled %s"):format(Money(open), Money(closed)))
+		for i, row in ipairs(ui.ledgerRows) do
+			local r = rows[ui.ledgerOffset + i]
+			if r then
+				row.who:SetText(r.who)
+				row.gold:SetText(Money(r.amount))
+				row.target:SetText(r.target)
+				row.when:SetText(Ago(r.when))
+				row.status:SetText(r.status .. (r.by ~= "" and (" (" .. r.by .. ")") or ""))
+				if r.status == "owes bank" or r.status == "refund due" then
+					row.status:SetTextColor(1, 0.82, 0.25)
+				else
+					row.status:SetTextColor(0.55, 0.72, 0.52)
+				end
+			else
+				row.who:SetText("") row.gold:SetText("") row.target:SetText("")
+				row.when:SetText("") row.status:SetText("")
+			end
+		end
+	end
+	ledgerBox:SetShown(false)
+
 	ui.boardWidgets = {
 		ui.blurb, ui.subtitle, ui.listBox, ui.deathBox, ui.detailBox,
 		ui.ledger, ui.owed, ui.add, ui.fund, ui.paid, ui.refund,
 		ui.announce, ui.officers, ui.sync, ui.delete,
 	}
 	SetTab = function(which)
+		if ui.tab ~= which then
+			if which == "board" then ui.order, ui.offset = nil, 0 end
+			if which == "ledger" then ui.ledgerOrder, ui.ledgerOffset = nil, 0 end
+		end
 		ui.tab = which
-		local boardMode = which ~= "leader"
+		local boardMode = which == "board"
 		for _, w in ipairs(ui.boardWidgets) do w:SetShown(boardMode) end
-		leaderBox:SetShown(not boardMode)
+		leaderBox:SetShown(which == "leader")
+		ledgerBox:SetShown(which == "ledger")
 		tabBoard:SetAlpha(boardMode and 1 or 0.55)
-		tabHunters:SetAlpha(boardMode and 0.55 or 1)
+		tabHunters:SetAlpha(which == "leader" and 1 or 0.55)
+		tabLedger:SetAlpha(which == "ledger" and 1 or 0.55)
 		refresh()
 	end
 	SetTab("board")
@@ -3471,7 +4545,7 @@ function ns.ShowAdd()
 		blurb:SetWidth(334)
 		blurb:SetJustifyH("LEFT")
 		blurb:SetWordWrap(true)
-		blurb:SetText("This only puts a name on the board. |cffffd100The bounty starts when the money is in the guild bank.|r")
+		blurb:SetText("This only puts a name on the board. |cffffd100/kos fund or a right-click makes the bounty live at once; the requester owes the bank until /kos paidup.|r")
 
 		local box = Inset(f, 18, -66, -18, 52)
 
@@ -3522,8 +4596,7 @@ function ns.ShowAdd()
 		cancel:SetScript("OnClick", function() f:Hide() end)
 		ui.addBox = f
 	end
-	local gold = ("%.4f"):format((tonumber(DB().defaultReward) or 0) / 10000)
-	f.rewardBox:SetText((gold:gsub("0+$", ""):gsub("%.$", "")))
+	f.rewardBox:SetText(tostring(math.floor((tonumber(DB().defaultReward) or 0) / 10000)))
 	f.nameBox:SetText("")
 	f.reasonBox:SetText("")
 	f:Show()
@@ -3531,23 +4604,13 @@ function ns.ShowAdd()
 	return f
 end
 
--- Use the same integer copper units that fit in a shared board entry.
-function Board.GoldToCopper(text)
-	local whole, fraction = text:match("^%s*(%d*)%.(%d*)%s*$")
-	if not whole then whole, fraction = text:match("^%s*(%d+)%s*$"), "" end
-	if not whole or (whole == "" and fraction == "") then return nil end
-	local amount = (tonumber(whole) or 0) * 10000 + tonumber((fraction .. "0000"):sub(1, 4))
-	if amount > Board.MAX_COPPER then return nil end
-	return amount
-end
-
 function ns.AddFromBox()
 	local f = ui.addBox
 	if not f then return end
 	local name = Clean(f.nameBox:GetText(), MAX_NAME)
 	if name == "" then Say("type the player's name first.") return end
-	local want = Board.GoldToCopper(f.rewardBox:GetText() or "")
-	if not want then Say("enter a gold amount from 0 to 10000.") return end
+	local gold = tonumber(((f.rewardBox:GetText() or ""):gsub("[^%d%.]", ""))) or (DEFAULT_REWARD / 10000)
+	local want = math.max(0, math.floor(gold * 10000))
 	local reason = Clean(f.reasonBox:GetText() or "", MAX_REASON)
 	if reason == "" then reason = "added by " .. MyName() end
 	local guid = GuidForName(name)
@@ -3577,8 +4640,8 @@ function ns.AddFromBox()
 		Broadcast(e, false)
 	end
 	if e then
-		Say("%s added. It is not a bounty until %s is in the guild bank - /kos fund %s.",
-			e.name, Money(math.max(0, (tonumber(e.want) or 0) - (tonumber(e.funded) or 0))), e.name)
+		Say("%s added. |cffffd100/kos fund %s|r makes the %s bounty live at once; you owe the bank until a manager marks it paid.",
+			e.name, e.name, Money(math.max(0, tonumber(e.want) or 0)))
 	end
 	f:Hide()
 	refresh()
@@ -3591,6 +4654,9 @@ KillOnSight_BuildUI = BuildWindow
 function ns.Toggle(force)
 	DB()
 	local f = BuildWindow()
+	-- Opening the window (or the merged panel) is the one moment the board re-sorts itself. Sync,
+	-- funding and claims must never reshuffle the rows under the player's cursor.
+	if force == true or not f:IsShown() then ui.order, ui.offset = nil, 0 end
 	if OlympusMytikasLoaded then
 		OlympusMytikas_Show("kos", f)
 		if force == true and refresh then pcall(refresh) end
@@ -3647,8 +4713,7 @@ end
 
 -- ============================================================================ commands
 
-local function Find(input, useSelection)
-	if useSelection and not (input or ""):find("%S") then return ui.selected end
+local function Find(input)
 	input = Clean(input or "", MAX_NAME)
 	if input == "" then return nil end
 	local s = Store()
@@ -3680,20 +4745,21 @@ local function Status()
 	Say("kill event: %s - in a guild: %s - sharing: %s - sent %d, refused %d, failed %d, heard %d",
 		ns.partyKill and "registered" or "not registered", tostring(Ask(IsInGuild)),
 		tostring(DB().share ~= false), stats.sent, stats.refused, stats.failed, stats.recv)
+	Say("delete authority: guild master or %s only - their deletes stay final on every client",
+		Board.MANAGER_RANK)
 	local rankName, rankIndex
 	if type(GetGuildInfo) == "function" then
 		local ok, _, rn, ri = pcall(GetGuildInfo, "player")
 		if ok and not Secret(rn, ri) then rankName, rankIndex = rn, ri end
 	end
-	Say("your rank: %s (index %s) - can remove/settle: %s (needs GM or %s)",
+	Say("your rank: %s (index %s) - can remove/settle/clear debts: %s (needs GM or %s)",
 		tostring(rankName or "UNREADABLE"), tostring(rankIndex or "?"),
 		tostring(Board.CanManage()), Board.MANAGER_RANK)
-	Say("guild bank gold: %s - daily withdrawal left: %s - cut: %d%% (10%% of it to the prize)",
-		money and Money(money) or "UNREADABLE (no bounty can be issued)",
+	Say("guild bank gold: %s - daily withdrawal left: %s - bank keeps %d%%",
+		money and Money(money) or "UNREADABLE",
 		BankWithdraw() and Money(BankWithdraw()) or "unreadable", tonumber(DB().cutPercent) or 0)
-	Say("ledger: escrowed %s, prize paid %s, bank cut %s, pooled %s, refunded %s, float %s",
-		Money(s.bank.escrowed), Money(s.bank.paid), Money(s.bank.cut), Money(s.bank.pool),
-		Money(s.bank.refunded), Money(s.bank.float))
+	Say("bounties are live on request, no deposit needed - totals: bank keeps %s, prize paid out %s, prize pool %s, refunded %s",
+		Money(s.bank.cut), Money(s.bank.paid), Money(s.bank.pool), Money(s.bank.refunded))
 	local nextDue, nextName
 	for _, e in pairs(s.entries) do
 		local due = RefundDue(e)
@@ -3701,9 +4767,10 @@ local function Status()
 	end
 	Say("refund policy: %d days unclaimed - %s", tonumber(DB().refundDays) or 0,
 		nextDue and ("next: %s in %s"):format(nextName, Left(nextDue - Clock())) or "nothing waiting")
-	local owed = Debts()
-	Say("not handed over yet: %d payment(s), %s - officer chat: %s",
-		#owed, #owed > 0 and Money(OwedTotal(owed)) or "the bank is square",
+	local owed, debts = Ious(), Debts()
+	Say("members owe the bank: %d debt(s), %s - bank owes: %d payment(s), %s - officer chat: %s",
+		#owed, #owed > 0 and Money(OwedTotal(owed)) or "nothing",
+		#debts, #debts > 0 and Money(OwedTotal(debts)) or "the bank is square",
 		OfficerChannel() == "OFFICER" and "officer chat" or "guild chat")
 	Say("addon channel: %s - prefix: %s", SendFn() and "available" or "missing", ns.prefixRegistered and "registered" or "no")
 	Say("if a death went unrecorded, |cffffd100/kos recap|r prints what the client actually gave.")
@@ -3781,16 +4848,17 @@ end
 local function Help()
 	Say("|cffffd100/kos|r - the board")
 	Say("|cffffd100/kos add <name> [gold] [reason]|r - put a player on the board")
-	Say("|cffffd100/kos bounty <name>|r - start a pending bounty job now (it pays only after the bank deposit)")
-	Say("|cffffd100/kos fund <name>|r - arm the bounty, then deposit that much into the guild bank")
-	Say("|cffffd100/kos deposited|r - check the bank again and publish it")
-	Say("|cffffd100/kos paid|r - the 70%% share is pooled now; use /kos boardpaid at month end")
+	Say("|cffffd100/kos bounty <name>|r, |cffffd100/kos fund <name>|r - put up a live 1g bounty now")
+	Say("|cffffd100/kos paidup <name>|r - GM or " .. Board.MANAGER_RANK ..
+		" only: mark a member's bounty debts paid")
+	Say("|cffffd100/kos paid|r - each hunter's 70%% goes into this month's prize pool; /kos boardpaid records the hand-over")
 	Say("|cffffd100/kos refund <name>|r - GM or " .. Board.MANAGER_RANK ..
-		" only: decide an unclaimed deposit goes back")
+		" only: decide an unclaimed bounty goes back")
 	Say("|cffffd100/kos handed <name>|r - GM or " .. Board.MANAGER_RANK ..
-		" only: you gave the deposit back; the refund is done")
-	Say("|cffffd100/kos owed|r - every payment the bank has not handed over yet")
+		" only: you gave the money back; the refund is done")
+	Say("|cffffd100/kos owed|r - who owes the bank for a live bounty, and what the bank has not handed over")
 	Say("|cffffd100/kos log|r - who removed an entry, decided a refund, handed one back or paid the prize")
+	Say("|cffffd100/kos chat|r - replay the hidden kill/death notices; |cffffd100/kos chat clear|r empties them")
 	Say("|cffffd100/kos board|r - this month's ranking and the whole prize pool")
 	Say("|cffffd100/kos boardpaid <name>|r - GM or " .. Board.MANAGER_RANK ..
 		" only: you handed the board leader that pool")
@@ -3798,17 +4866,22 @@ local function Help()
 	Say("|cffffd100/kos officermode auto|officer|guild|r - where that line goes (now %s)", DB().officerMode or "auto")
 	Say("|cffffd100/kos refunddays <n>|r - how long a bounty waits (now %d days, 0 = never)", tonumber(DB().refundDays) or 0)
 	Say("|cffffd100/kos announce [name]|r - post one line to guild chat")
+	Say("|cffffd100/kos swap [name]|r - whisper the victim who set the bounty for an invite to that killer's layer (LayerSwap hosts answer too)")
 	Say("|cffffd100/kos cut <pct>|r - what the bank keeps (now %d%%)", tonumber(DB().cutPercent) or 0)
 	Say("|cffffd100/kos remove <name> [force]|r - GM or " .. Board.MANAGER_RANK ..
 		" only: take one off the board (refused while money is owed)")
-	Say("anyone can add a name, fund a bounty and announce it - only GM or " .. Board.MANAGER_RANK ..
-		" can remove entries or clear what the bank owes.")
+	Say("anyone can add a name, put up a bounty and announce it - only GM or " .. Board.MANAGER_RANK ..
+		" can remove entries, clear a member's debt or record what the bank handed over.")
 	Say("|cffffd100/kos reward <gold>|r, |cffffd100/kos list|r, |cffffd100/kos bank|r, |cffffd100/kos sync|r, |cffffd100/kos status|r")
-	Say("|cffffd100/kos where [name]|r - the last known location on a board row, plus what map data this client exposed")
+	Say("|cffffd100/kos where [name]|r - last known location, killer level/layer and what this client exposed")
 	Say("|cffffd100/kos pins|r - refresh and count the map pins (they expire after 30 minutes; addon users only)")
+	Say("|cffffd100/kos badge|r - scan visible nameplates and say whether the skull is actually on the bounty")
+	Say("|cffffd100/kos warn|r - turn the local raid-style warning banner on/off (now %s)",
+		DB().warnNearby == false and "off" or "on")
 	Say("|cffffd100/kos recap|r - what the client gave about your last death (for a death that did not count)")
 	Say("|cffffd100/kos kills|r - who killed who in the guild; |cffffd100/kos kills mine|r - only your deaths")
 	Say("|cffffd100/kos share|r, |cffffd100/kos notices|r, |cffffd100/kos minimap|r, |cffffd100/kos reset|r")
+	Say("|cffffd100/kos notice|r - show the read-this-first page again as a preview (no acknowledgement changes)")
 end
 
 local function Handler(msg)
@@ -3817,20 +4890,26 @@ local function Handler(msg)
 	local cmd, rest = msg:match("^%s*(%S*)%s*(.*)$")
 	cmd = (cmd or ""):lower()
 	rest = rest or ""
+	if cmd == "on" then
+		ns.SetEnabled(true)
+		Say("Kill on Sight is ON.")
+		return
+	end
+	if cmd == "off" then
+		ns.SetEnabled(false)
+		Say("Kill on Sight is OFF.")
+		return
+	end
+	if not ns.Enabled() then
+		Say("Kill on Sight is OFF - use the button in the Olympus Mytikas window or /kos on to turn it back on.")
+		return
+	end
 	if cmd == "" then ns.Toggle() return end
 
 	if cmd == "add" then
 		local name, gold, reason = rest:match("^(%S+)%s*(%S*)%s*(.*)$")
 		if not name then Say("usage: /kos add <name> [gold] [reason]") return end
-		local want = tonumber(DB().defaultReward) or 0
-		if gold ~= "" then
-			if gold:match("^[%d.+-]") then
-				want = Board.GoldToCopper(gold)
-				if not want then Say("enter a gold amount from 0 to 10000.") return end
-			else
-				reason = gold .. " " .. reason
-			end
-		end
+		local want = tonumber(gold) and math.max(0, math.floor(tonumber(gold) * 10000)) or (tonumber(DB().defaultReward) or 0)
 		local text = Clean(reason, MAX_REASON)
 		local e
 		local guid = GuidForName(name)
@@ -3860,7 +4939,7 @@ local function Handler(msg)
 			Broadcast(e, false)
 		end
 		if e then
-			Say("%s added. Not a bounty yet - %s must be deposited first.",
+			Say("%s added. /kos fund makes a %s bounty live at once.",
 				e.name, Money(math.max(0, (tonumber(e.want) or 0) - (tonumber(e.funded) or 0))))
 		end
 		RefreshIfShown()
@@ -3868,7 +4947,8 @@ local function Handler(msg)
 	end
 
 	if cmd == "bounty" or cmd == "job" then
-		local e = Find(rest, true)
+		local e = Find(rest)
+		if not e then e = ui.selected end
 		if not e then Say("nobody called %q is on the board.", Clean(rest, MAX_NAME)) return end
 		local ok, why = ns.StartBounty(e, true)
 		if not ok then Say("%s", tostring(why)) end
@@ -3876,24 +4956,26 @@ local function Handler(msg)
 	end
 
 	if cmd == "fund" then
-		local e = Find(rest, true)
-		if not e then Say("nobody called %q is on the board.", Clean(rest, MAX_NAME)) return end
-		local ok, why = Fund(e)
-		if ok then
-			Say("%s: deposit %s into the guild bank now. The bounty is published when the bank's gold shows it.",
-				e.name, Money(why))
-		else
-			Say("%s", tostring(why))
+		local e = Find(rest)
+		if not e then
+			if ui.selected then e = ui.selected end
 		end
-		return
-	end
-	if cmd == "deposited" then
-		local ok, why = ObserveDeposit()
+		if not e then Say("nobody called %q is on the board.", Clean(rest, MAX_NAME)) return end
+		local ok, _, why = StartJob(e, true)
 		if not ok then Say("%s", tostring(why)) end
 		return
 	end
+	if cmd == "paidup" then
+		local ok, why = PaidUp(rest, MyName())
+		if not ok then Say("%s", tostring(why)) end
+		return
+	end
+	if cmd == "deposited" then
+		Say("nothing to check: a bounty is live as soon as somebody asks for it. The requester owes the gold until a manager uses /kos paidup.")
+		return
+	end
 	if cmd == "payout" or cmd == "paid" then
-		Say("hunters are not paid per kill: each 70%% share joins this month's prize pool. " ..
+		Say("hunters are not paid per kill: each hunter's 70%% goes into this month's prize pool. " ..
 			"The board leader is paid once at month end - /kos boardpaid records it.")
 		return
 	end
@@ -3916,15 +4998,32 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "owed" then
-		local list = Debts()
-		if #list == 0 then Say("the bank owes nothing - every bounty is either open or settled.") return end
-		Say("|cffffd100the guild bank still owes %s|r - %d payment%s not handed over yet:",
-			Money(OwedTotal(list)), #list, #list == 1 and "" or "s")
-		for i = 1, #list do
-			local d = list[i]
-			Say("  %d. %s - %s %s%s", i, d.name, Money(d.amount),
-				d.kind == "refund" and "back to "
-					or (d.kind == "monthly" and "prize pool to " or "to "), d.to)
+		local list, ious = Debts(), Ious()
+		if #list == 0 and #ious == 0 then
+			Say("nobody owes anything - every bounty is either open or settled.")
+			return
+		end
+		if #ious > 0 then
+			local total = 0
+			for i = 1, #ious do total = total + (tonumber(ious[i].amount) or 0) end
+			Say("|cffffd100members owe the guild bank %s|r - %d live bounty debt%s:",
+				Money(total), #ious, #ious == 1 and "" or "s")
+			for i = 1, #ious do
+				local d = ious[i]
+				Say("  %d. %s owes %s for %s%s", i, d.name, Money(d.amount), d.target or "?",
+					d.entry and d.entry.paidUp and " (already paid up)" or "")
+			end
+			Say("a manager clears them with |cffffd100/kos paidup <name>|r.")
+		end
+		if #list > 0 then
+			Say("|cffffd100the guild bank still owes %s|r - %d payment%s not handed over yet:",
+				Money(OwedTotal(list)), #list, #list == 1 and "" or "s")
+			for i = 1, #list do
+				local d = list[i]
+				Say("  %d. %s - %s %s%s", i, d.name, Money(d.amount),
+					d.kind == "refund" and "back to "
+						or (d.kind == "monthly" and "prize pool to " or "to "), d.to)
+			end
 		end
 		Say("say it: |cffffd100/kos officers|r (%s) - refund: |cffffd100/kos handed <name>|r - prize: |cffffd100/kos boardpaid|r.",
 			OfficerChannel() == "OFFICER" and "officer chat" or "guild chat")
@@ -3954,7 +5053,8 @@ local function Handler(msg)
 		local trimmed = name:match("^(.-)%s+force%s*$")
 		if trimmed then force, name = true, trimmed end
 		if name:lower() == "force" then force, name = true, "" end
-		local e = Find(name, true)
+		local e = Find(name)
+		if not e and ui.selected then e = ui.selected end
 		if not e then Say("nobody called %q is on the board.", Clean(name, MAX_NAME)) return end
 		local ok, why = Remove(e.guid, force)
 		if not ok then
@@ -3968,9 +5068,17 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "announce" then
-		local e = Find(rest, true)
+		local e = Find(rest)
+		if not e then e = ui.selected end
 		if not e then Say("nothing to announce yet.") return end
+		ns.FillKillerInfo(e)
 		Announce(e)
+		return
+	end
+	if cmd == "swap" or cmd == "swapto" then
+		local e = Find(rest)
+		if not e then e = ui.selected end
+		ns.SwapToLayer(e)
 		return
 	end
 	if cmd == "cut" then
@@ -3990,10 +5098,10 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "reward" then
-		local amount = Board.GoldToCopper(rest)
-		if not amount then Say("usage: /kos reward <0-10000 gold>") return end
-		DB().defaultReward = amount
-		Say("a death now asks for %s - still deposit first.", Money(DB().defaultReward))
+		local gold = tonumber(rest)
+		if not gold or gold < 0 then Say("usage: /kos reward <gold>") return end
+		DB().defaultReward = math.floor(gold * 10000)
+		Say("a bounty now asks for %s - live as soon as somebody requests it.", Money(DB().defaultReward))
 		return
 	end
 	if cmd == "board" then
@@ -4009,9 +5117,8 @@ local function Handler(msg)
 		local money = BankMoney()
 		local s = Store().bank
 		Say("bank gold now: %s", money and Money(money) or "UNREADABLE")
-		Say("escrowed %s, prize paid %s, bank cut %s, pooled %s, refunded %s, float %s",
-			Money(s.escrowed), Money(s.paid), Money(s.cut), Money(s.pool),
-			Money(s.refunded), Money(s.float))
+		Say("bank keeps %s, prize paid out %s, prize pool %s, refunded %s - bounties are live on request",
+			Money(s.cut), Money(s.paid), Money(s.pool), Money(s.refunded))
 		local month = Board.BoardMonth(Clock())
 		local owed = Board.FundForMonth(month)
 		local a = Store().board.award
@@ -4043,9 +5150,10 @@ local function Handler(msg)
 			elseif (tonumber(e.funded) or 0) > 0 then bounty = Money(e.funded) .. " bounty"
 			else bounty = StateText(e) end
 			local where = SpotLine(d)
-			Say("  %s%s|r killed %s - %s - %s%s", DeathColor(d), d.kname,
+			local info = ns.KillerLine(d)
+			Say("  %s%s|r killed %s - %s - %s%s%s", DeathColor(d), d.kname,
 				SameName(d.vname, MyName()) and "|cffffd100you|r" or (d.vname ~= "" and d.vname or "?"),
-				Ago(d.at), bounty, where and (" - " .. where) or "")
+				Ago(d.at), bounty, info and (" - " .. info) or "", where and (" - " .. where) or "")
 		end
 		Say("click a killer's name in the window to select him and set a bounty: |cffffd100/kos|r")
 		return
@@ -4062,6 +5170,20 @@ local function Handler(msg)
 	end
 	if cmd == "log" then
 		Board.LogPrint()
+		return
+	end
+	if cmd == "chat" then
+		if rest:lower():match("^clear") then
+			ns.chatLog = {}
+			Say("hidden kill notices cleared.")
+			return
+		end
+		if #ns.chatLog == 0 then
+			Say("no hidden kill notices yet.")
+			return
+		end
+		Say("|cffffd100hidden kill notices (oldest first):|r")
+		for i = 1, #ns.chatLog do Say("%d. %s", i, ns.chatLog[i]) end
 		return
 	end
 	if cmd == "sync" then
@@ -4095,14 +5217,39 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "status" then Status() return end
+	if cmd == "warn" then
+		DB().warnNearby = DB().warnNearby == false
+		ns.warned = {}
+		Say("nearby bounty warnings are now %s (a local raid-style banner; no chat raid warning is sent).",
+			DB().warnNearby == false and "off" or "on")
+		return
+	end
+	if cmd == "badge" or cmd == "marks" then
+		if ns.BadgeReport then pcall(ns.BadgeReport) end
+		return
+	end
+	if cmd == "notice" or cmd == "welcome" then
+		Say("showing the read-this-first page as a preview; your acknowledgement is unchanged.")
+		ShowWelcome(true)
+		return
+	end
 	if cmd == "where" or cmd == "spot" then
-		local e = Find(rest, true)
+		local e = Find(rest) or ui.selected
 		if not e then
 			Say("nobody called %q is on the board - select an enemy first. Client map reads: %s",
 				Clean(rest, MAX_NAME), MapProbeLine())
 			return
 		end
+		ns.FillKillerInfo(e)
 		Say("%s: %s", e.name, SpotStatus(e))
+		Say("killer: %s", ns.KillerLine(e) or "level and layer unknown - the client gave nothing readable")
+		local cached = e and ns.seenLevels[e.guid]
+		Say("level read: %s; guild roster: %s; Olympus record: %s; LayerSwap layer: %s",
+			cached and ("seen level " .. tostring(cached.level) .. " " ..
+				(Clock() - (tonumber(cached.at) or 0)) .. "s ago") or "no sighting cached",
+			tostring(ns.GuildLevel(e.name) or "unknown"),
+			tostring(ns.OlympusLevel(e.guid, e.name) or "unknown"),
+			tostring(ns.MyLayer() or "unknown"))
 		Say("client map reads: %s", MapProbeLine())
 		return
 	end
@@ -4123,8 +5270,7 @@ local function Handler(msg)
 	if cmd == "recap" then RecapDump() return end
 	if cmd == "reset" then
 		local s = Store()
-		s.entries, s.removed = {}, {}
-		armed = nil
+		DB().scopes[Scope()] = { entries = {}, removed = {}, deaths = s.deaths or {}, ver = 1 }
 		ui.selected = nil
 		MapLib.pinDirty = true
 		Say("this realm's board is wiped (the guild death history is kept).")
@@ -4135,11 +5281,11 @@ local function Handler(msg)
 end
 
 -- ============================================================================ nameplate badge
--- An addon cannot place a real world marker over another player. What it can do is hang a small
--- badge on that player's nameplate, and only for people running Kill on Sight. Nameplates are
--- recycled between units, so a badge is made once per plate and then shown or hidden on every
--- refresh; a plate belonging to an unfunded or settled target never carries one.
-local MARK_ART = "Interface\\AddOns\\OlympusMytikas\\Media\\bounty"
+-- This local badge is NOT the shared raid marker - Forever refuses to let addons set that.
+-- It uses Blizzard's own skull texture so it reads as the same icon, and it is drawn per client
+-- for people running Kill on Sight. Nameplates are recycled between units, so the badge is made
+-- once per plate and shown or hidden on every refresh; unfunded or settled targets get none.
+local MARK_ART = "Interface\\TargetingFrame\\UI-RaidTargetingIcon_8"
 local marks = {}
 
 local function MarkWanted(e)
@@ -4147,43 +5293,129 @@ local function MarkWanted(e)
 	return (tonumber(e.funded) or 0) > 0
 end
 
+-- A real RAID_WARNING chat send is protected on this client, but the game's own warning BANNER is
+-- not: addons here already call RaidNotice_AddMessage(RaidWarningFrame, ...) from timers. Use that
+-- for the "bounty is near me" notice - local to this hunter, no leader/assist needed, no spam chat.
+ns.WARN_COOLDOWN = 30
+ns.warned = ns.warned or {}
+ns.BountyWarning = function(e)
+	if not e then return end
+	local name = (e.name ~= "") and e.name or "Unknown"
+	local text = ("BOUNTY IN RANGE: %s (%s)"):format(name, Money(tonumber(e.funded) or 0))
+	local color = (type(ChatTypeInfo) == "table" and ChatTypeInfo["RAID_WARNING"])
+		or { r = 1, g = 0.82, b = 0 }
+	if type(RaidNotice_AddMessage) == "function" and type(RaidWarningFrame) == "table" then
+		pcall(RaidNotice_AddMessage, RaidWarningFrame, text, color)
+	elseif type(UIErrorsFrame) == "table" and type(UIErrorsFrame.AddMessage) == "function" then
+		pcall(UIErrorsFrame.AddMessage, UIErrorsFrame, text, 1, 0.82, 0)
+	else
+		Say("%s", text)
+	end
+	if type(PlaySoundFile) == "function" then
+		pcall(PlaySoundFile, "Sound\\Interface\\RaidWarning.ogg")
+	end
+end
+
 local function MakeMark(plate)
 	local m = CreateFrame("Frame", nil, plate)
-	m:SetSize(26, 26)
+	m:SetSize(32, 32)
 	local icon = m:CreateTexture(nil, "OVERLAY")
 	icon:SetAllPoints(m)
 	icon:SetTexture(MARK_ART)
 	m.icon = icon
-	local label = m:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	label:SetText("KoS")
-	label:SetPoint("BOTTOM", m, "TOP", 0, 1)
-	m.label = label
 	return m
 end
 
 local function RefreshMarks()
+	if not ns.Enabled() then
+		for plate, m in pairs(marks) do m:Hide() end
+		ns.warned = {}
+		return
+	end
+	-- Keep the short sighting cache fed while the world is visible, before the death screen hides it.
+	for _, unit in ipairs(ns.InfoUnits()) do ns.RememberLevel(unit) end
 	if type(C_NamePlate) ~= "table" or type(C_NamePlate.GetNamePlateForUnit) ~= "function" then return end
 	local seen = {}
+	local nearby = {}
+	local warn = (DB().warnNearby ~= false)
+	if not warn then ns.warned = {} end
 	for i = 1, 40 do
 		local unit = "nameplate" .. i
 		local ok, plate = pcall(C_NamePlate.GetNamePlateForUnit, unit)
 		if ok and type(plate) == "table" then
 			local guid = Guid(Ask(UnitGUID, unit))
-			if guid and Ask(UnitIsPlayer, unit) ~= false and MarkWanted(Entry(guid)) then
+			ns.RememberLevel(unit)
+			local e = guid and Entry(guid) or nil
+			-- An older row may have been saved with both numbers at 0. A target we can actually see
+			-- now is a real sighting, so fill what is missing; never fill from a name alone.
+			if e and ((tonumber(e.klevel) or 0) <= 0 or not ns.LayerFresh(e)) then
+				pcall(ns.FillKillerInfo, e)
+			end
+			if guid and Ask(UnitIsPlayer, unit) ~= false and MarkWanted(e) then
 				seen[plate] = true
 				local m = marks[plate]
 				if not m then
 					m = MakeMark(plate)
 					marks[plate] = m
 				end
-				m:SetPoint("CENTER", plate, "CENTER", 0, 26)
+				m:SetPoint("CENTER", plate, "CENTER", 0, 30)
 				m:Show()
+				if warn then
+					nearby[guid] = true
+					local now = Mono()
+					local last = ns.warned[guid]
+					if not last or (now - last) >= ns.WARN_COOLDOWN then
+						ns.warned[guid] = now
+						pcall(ns.BountyWarning, e)
+					end
+				end
 			end
 		end
+	end
+	-- Leaving the area (or settling the bounty) clears the repeat timer, so walking
+	-- back into range fires the banner again instead of waiting out the cooldown.
+	for guid in pairs(ns.warned) do
+		if not nearby[guid] then ns.warned[guid] = nil end
 	end
 	for plate, m in pairs(marks) do
 		if not seen[plate] then m:Hide() end
 	end
+end
+
+-- /kos badge: prove what the scan above can actually see on this client. It is a diagnostic,
+-- not a second badge path - the skull is still drawn only by RefreshMarks.
+local function BadgeReport()
+	if type(C_NamePlate) ~= "table" or type(C_NamePlate.GetNamePlateForUnit) ~= "function" then
+		Say("no nameplate API here, so no badge can be drawn.")
+		return
+	end
+	local plates, players, skulls = 0, 0, 0
+	for i = 1, 40 do
+		local unit = "nameplate" .. i
+		local ok, plate = pcall(C_NamePlate.GetNamePlateForUnit, unit)
+		if ok and type(plate) == "table" then
+			plates = plates + 1
+			if Ask(UnitIsPlayer, unit) ~= false then
+				players = players + 1
+				local guid = Guid(Ask(UnitGUID, unit))
+				local name = Clean(Ask(UnitName, unit) or "?", MAX_NAME)
+				local e = guid and Entry(guid) or nil
+				local m = marks[plate]
+				if MarkWanted(e) and m and m:IsShown() then skulls = skulls + 1 end
+				local why
+				if not guid then why = "no usable GUID"
+				elseif not e then why = "not on the board"
+				elseif not MarkWanted(e) then why = "not a funded live bounty"
+				elseif not m then why = "badge frame missing"
+				elseif not m:IsShown() then why = "badge hidden"
+				else why = "SKULL SHOWN" end
+				Say("plate %d: %s - %s", i, name, why)
+			end
+		end
+	end
+	Say("badge scan: %d plate(s), %d player(s), %d skull(s) on screen", plates, players, skulls)
+	Say("nearby bounty warning banner: %s (repeat %ds while one stays in range; never a chat raid warning)",
+		DB().warnNearby == false and "off" or "on", tonumber(ns.WARN_COOLDOWN) or 30)
 end
 
 -- ============================================================================ wiring
@@ -4199,6 +5431,9 @@ local function On(event, fn)
 end
 
 frame:SetScript("OnEvent", function(self, event, ...)
+	-- A disabled addon does nothing in the world: no deaths, no sync, no plates, no reminders.
+	-- ADDON_LOADED and PLAYER_LOGIN still pass so Init can run and the button can turn it back on.
+	if not ns.Enabled() and event ~= "ADDON_LOADED" and event ~= "PLAYER_LOGIN" then return end
 	local list = handlers[event]
 	if not list then return end
 	for i = 1, #list do
@@ -4213,6 +5448,7 @@ end)
 On("ADDON_LOADED", function(name)
 	if name ~= ADDON then return end
 	Init()
+	if not ns.Enabled() then return end
 	ShowWelcome()
 	ns.partyKill = pcall(frame.RegisterEvent, frame, "PARTY_KILL")
 	ns.prefixRegistered = false
@@ -4225,33 +5461,40 @@ end)
 On("PLAYER_LOGIN", function()
 	DB()
 	Board.BoardRollover(Clock())
-	ShowWelcome()
+	if ns.Enabled() then ShowWelcome() end
 	ns.prefixRegistered = false
 	if type(C_ChatInfo) == "table" and type(C_ChatInfo.RegisterAddonMessagePrefix) == "function" then
 		ns.prefixRegistered = pcall(C_ChatInfo.RegisterAddonMessagePrefix, PREFIX)
 	end
 	if type(C_Timer) == "table" and type(C_Timer.NewTicker) == "function" then
-		C_Timer.NewTicker(SEND_INTERVAL, function() pcall(Pump) end)
-		C_Timer.NewTicker(180, function() pcall(Sweep) end)
+		local live = function() return ns.Enabled() end
+		C_Timer.NewTicker(SEND_INTERVAL, function() if live() then pcall(Pump) end end)
+		C_Timer.NewTicker(180, function() if live() then pcall(Sweep) end end)
 		-- The debt reminder keeps coming back until somebody actually hands the gold over.
-		C_Timer.NewTicker(OFFICER_REMIND, function() pcall(Remind) end)
+		C_Timer.NewTicker(OFFICER_REMIND, function() if live() then pcall(Remind) end end)
 		-- A death watch, so a client that raises no PLAYER_DEAD still records who killed you.
-		C_Timer.NewTicker(2, function() pcall(WatchDeath) end)
+		C_Timer.NewTicker(2, function() if live() then pcall(WatchDeath) end end)
 		-- Nameplates come and go (and are recycled), so the bounty badge is reconciled often.
 		C_Timer.NewTicker(0.5, function() pcall(RefreshMarks) end)
 		-- The map pins are changed by board updates and input-mode switches, not every frame.
 		-- A pin also ages out on its own 30 minutes after the last sighting.
 		C_Timer.NewTicker(1, function()
+			if not live() then return end
 			local ok, expired = pcall(MapLib.HasExpired)
 			if MapLib.pinDirty or (ok and expired) then pcall(MapLib.Refresh) end
 		end)
 	end
 	if type(C_Timer) == "table" and type(C_Timer.After) == "function" then
-		C_Timer.After(8, function() SendDigest(false) QueueParts("H", false) end)
-		C_Timer.After(HELLO_EVERY, function() QueueParts("H", false) end)
-		C_Timer.After(20, function() pcall(Remind) end)
+		-- Old rows stay in saved variables with 0 level/layer. Repair them from Olympus evidence and
+		-- LayerSwap's letter table on login so the board shows the fix without needing a new death.
+		C_Timer.After(2, function() if ns.Enabled() then pcall(ns.BackfillSavedInfo) end end)
+		C_Timer.After(8, function() if ns.Enabled() then SendDigest(false) QueueParts("H", false) end end)
+		C_Timer.After(HELLO_EVERY, function() if ns.Enabled() then QueueParts("H", false) end end)
+		C_Timer.After(20, function()
+			-- Let other clients answer the first digest first, then remind debtors.
+			if ns.Enabled() then pcall(Remind) end
+		end)
 	end
-	BankSeen()
 end)
 
 On("PLAYER_ENTERING_WORLD", function()
@@ -4272,11 +5515,15 @@ On("PLAYER_DEAD", function() OnPlayerDead() end)
 On("PARTY_KILL", function(a, b) OnPartyKill(a, b) end)
 On("CHAT_MSG_ADDON", function(prefix, text, dist, sender) OnAddonMessage(prefix, text, dist, sender) end)
 On("CHAT_MSG_GUILD", function(text, sender) OnGuildChat(text, sender) end)
-
--- The bank: a baseline when it opens, and the moment its gold moves is the deposit we watch for.
-On("GUILDBANKFRAME_OPENED", function() BankSeen() end)
-On("GUILDBANK_UPDATE_MONEY", function() ObserveDeposit() end)
-On("PLAYER_INTERACTION_MANAGER_FRAME_SHOW", function(kind) BankSeen() end)
+-- The LayerSwap notes last only a few seconds. Refresh them when our own whisper is actually sent,
+-- so a player who waits before pressing Enter still reaches a host on the victim's side.
+On("CHAT_MSG_WHISPER_INFORM", function(text, sender)
+	local p = ns.pendingSwap
+	if p and p.text and SameName(sender, p.target) and Clean(text, 200) == Clean(p.text, 200) then
+		ns.SendSwapNotes(p.target, p.zone, p.id)
+		ns.pendingSwap = nil
+	end
+end)
 
 SLASH_KILLONSIGHT1 = "/kos"
 SLASH_KILLONSIGHT2 = "/killonsight"
@@ -4284,15 +5531,18 @@ SlashCmdList["KILLONSIGHT"] = function(msg) Handler(msg) end
 
 ns.Handler = Handler
 ns.Init = Init
+-- The merged shell calls this from its on/off button; KoS stands alone if it is absent.
+KillOnSight_SetEnabled = ns.SetEnabled
+KillOnSight_Enabled = ns.Enabled
 ns.ui = ui
 ns.ShowWelcome = ShowWelcome
+ns.PreviewWelcome = function() ShowWelcome(true) end
 ns.Status = Status
 ns.RecapDump = RecapDump
 ns.CaptureDeath = CaptureDeath
 ns.OnPlayerDead = OnPlayerDead
 ns.OnPartyKill = OnPartyKill
 ns.OnAddonMessage = OnAddonMessage
-ns.OnBankMoneyChanged = ObserveDeposit
 ns.ApplyEntry = ApplyEntry
 ns.ApplyRemoval = ApplyRemoval
 ns.ParseEntry = ParseEntry
@@ -4300,14 +5550,14 @@ ns.RowFor = RowFor
 ns.AddKill = AddKill
 ns.ClaimKill = ClaimKill
 ns.Fund = Fund
-ns.ConfirmFunding = ConfirmFunding
-ns.TryArmFromManual = ObserveDeposit
 ns.PoolKill = PoolKill
 ns.Refund = Refund
 ns.Expire = Expire
 ns.ConfirmRefund = ConfirmRefund
 ns.HandOver = HandOver
 ns.Debts = Debts
+ns.Ious = Ious
+ns.PaidUp = PaidUp
 ns.BoardMonth = Board.BoardMonth
 ns.BoardRow = Board.BoardRow
 ns.ParseBoardRow = Board.ParseBoardRow
@@ -4368,9 +5618,9 @@ ns.RefreshMapPins = function()
 	return MapLib.Refresh()
 end
 ns.RefreshMarks = RefreshMarks
+ns.BadgeReport = BadgeReport
 ns.marks = marks
 ns.BankMoney = BankMoney
-ns.arm = function() return armed end
 ns.stats = stats
 ns.queue = queue
 ns.PREFIX = PREFIX
