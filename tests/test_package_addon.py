@@ -1,5 +1,6 @@
 """Exercise the release CLI against an independent, tagged addon repository."""
 
+from contextlib import chdir
 import hashlib
 import os
 import subprocess
@@ -7,6 +8,9 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from unittest.mock import patch
+
+from scripts import prepare_release
 from pathlib import Path
 
 
@@ -67,6 +71,34 @@ class PackageTest(unittest.TestCase):
         with zipfile.ZipFile(self.out, "a") as archive:
             archive.writestr("OlympusMytikas/surprise.lua", "")
         self.package("validate", error="contents differ")
+
+    def test_published_event_preserves_website_zip_bytes(self):
+        self.package()
+        built = self.out.read_bytes()
+        # The moderator used a different ZIP writer for the same tagged tree.
+        with zipfile.ZipFile(self.out) as source:
+            files = [(entry.filename, source.read(entry)) for entry in source.infolist() if not entry.is_dir()]
+        with zipfile.ZipFile(self.out, "w", compression=zipfile.ZIP_STORED) as uploaded:
+            for name, contents in reversed(files):
+                uploaded.writestr(name, contents)
+            uploaded.comment = b"Moderator upload"
+        original = self.out.read_bytes()
+        self.assertNotEqual(built, original)
+        self.out.unlink()
+        release = dict(draft=False, prerelease=False, tag_name=TAG, assets=[
+            dict(name=self.out.name, digest="sha256:" + hashlib.sha256(original).hexdigest())
+        ])
+
+        def download(*args):
+            self.assertEqual(args, ("release", "download", TAG, "--pattern", self.out.name, "--dir", str(self.root)))
+            self.out.write_bytes(original)
+
+        with chdir(self.root), patch.object(prepare_release, "release_info", return_value=release), \
+                patch.object(prepare_release, "gh", side_effect=download) as gh, \
+                patch.dict(os.environ, GITHUB_OUTPUT=""):
+            result = prepare_release.prepare(TAG, self.root, existing_only=False)
+        gh.assert_called_once()
+        self.assertEqual(result.read_bytes(), original)
 
     def test_rejects_mismatched_version_and_invalid_tag_or_name(self):
         self.git("tag", "v1.1.0")

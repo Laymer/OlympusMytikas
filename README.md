@@ -4,7 +4,15 @@ For bug reports, checkout setup and local testing, see [Contributing](CONTRIBUTI
 
 Olympus Mytikas brings the guild's recruitment tools and Kill on Sight board into one World of Warcraft addon. Open its window from the minimap to post a recruitment message, review enemy sightings and bounties, or see the installed version.
 
-## Publish a release
+## Review a guild website upload
+
+When the guild enables reviewed website submissions, an administrator uploads an installable ZIP, its version, and public release notes through the official release form. The synchronizer opens a pull request from `Laymer/OlympusMytikas` to this repository. Review the complete diff under `OlympusMytikas/`, including deleted files, read the player-facing notes in the PR, and check the Addon behavior result before merging. Close the PR to decline the submission.
+
+After merge, the synchronizer compares the merged addon files with the stored ZIP, waits for the addon checks, and tags the reviewed commit. It attaches the original ZIP to a draft release and verifies the asset digest before publishing. The published event runs the CurseForge workflow below. Members can download the release on the website once it is published on GitHub. A CurseForge receipt records submission to CurseForge, whose moderation status is visible in the author dashboard.
+
+If a maintainer changes the addon contents during review, submit the revised ZIP under a new version for review. The release must match the reviewed source and the administrator’s original ZIP. For a failed CurseForge submission after GitHub publication, follow **Recover a release** below.
+
+## Publish a release manually
 
 Once the CurseForge project is connected, publishing a stable GitHub release starts the upload. GitHub Actions builds the installable ZIP, attaches it to the release, and submits the same bytes to CurseForge. Member Home can continue importing the GitHub asset.
 
