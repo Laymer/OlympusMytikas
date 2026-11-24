@@ -239,11 +239,17 @@ local function offscreenSync()
     assert(peer.Entry(loose.guid) and peer.Entry(loose.guid).want == 10000)
     assert(not peer.ApplyBoardCredit({who="Hunter", target=loose.guid, amount=10000, at=1800000000}))
     assert(ns.Remove(loose.guid))
-    receive("R~n:offscreen~" .. ns.Store().removed["n:offscreen"])
+    local removal = "R~n:offscreen~" .. ns.Store().removed["n:offscreen"]
+    receive(removal)
+    local oldCopy = row:gsub("^(E~[^~]+~)%d+~", "%1" .. tostring(ns.Store().removed["n:offscreen"] + 10) .. "~")
+    receive(oldCopy)
     assert(not peer.Entry("n:offscreen"))
+    assert(not ns.AddKill("Player-1-ABCDEF11", "Offscreen", "MAGE", "death"))
     command("add Offscreen 1")
     row = ns.RowFor(entries["n:offscreen"], true)
     receive(row)
+    receive(removal)
+    assert(peer.Entry("n:offscreen"))
     local real = ns.AddKill("Player-1-ABCDEF11", "Offscreen", "MAGE")
     receive(ns.RowFor(real, true))
     receive(row) -- A delayed old digest must not resurrect the loose name.
@@ -291,18 +297,98 @@ local function largeDigest()
 end
 largeDigest()
 
+local function sharedBounty()
+    local now = 1800000000
+    local env, load = client({name = "Officer", realm = "Fixture", rankIndex = 0}, {})
+    local peerEnv, peerLoad, event, messages = client({name = "Member", realm = "Fixture"}, {})
+    local ns, peer = load("KillOnSight"), peerLoad("KillOnSight")
+    env.GetServerTime = function() return now end
+    peerEnv.GetServerTime = env.GetServerTime
+    peerEnv.IsInGuild = function() return true end
+    peerEnv.GetNumGuildMembers = function() return 1 end
+    peerEnv.GetGuildRosterInfo = function() return "Officer", "Valar", 1 end
+    local function send(row, name)
+        event("CHAT_MSG_ADDON", "KOS", row, "GUILD", name or "Officer")
+    end
+    local command = peerEnv.SlashCmdList.KILLONSIGHT
+    local e = ns.AddKill("Player-1-ABCDEF01", "Rival", "MAGE", "death", nil, nil, 54, "P")
+    env.SlashCmdList.KILLONSIGHT("bounty Rival")
+    assert(e.funded == 10000 and e.fundedBy == "Officer")
+    command("off")
+    send(ns.RowFor(e))
+    assert(not peer.Enabled() and not peer.Entry(e.guid))
+    command("on")
+    local before = #messages
+    local unpaidRow = ns.RowFor(e)
+    send(unpaidRow)
+    local shared = assert(peer.Entry(e.guid))
+    assert(peer.Enabled() and #messages == before and #peer.chatLog > 0)
+    command("chat")
+    expectLine(messages, "Rival")
+    command("chat clear")
+    assert(#peer.chatLog == 0)
+    assert(peer.KillerLine(shared) == "level 54, layer P")
+    now = now + 3600
+    assert(peer.KillerLine(shared) == "level 54")
+    assert(not peer.LayerFresh(peer.ParseEntry(ns.RowFor(e))))
+    assert(not peer.LayerFresh({klayer = "S", klayerAt = now}))
+
+    -- The previous generation sent 3g in the ask and funded fields.
+    local oldRow = "E~Player-1-ABCDEF02~2~30000~30000~1~0~~Prior"
+    send(oldRow)
+    local old = assert(peer.Entry("Player-1-ABCDEF02"))
+    assert(old.want == 10000 and old.funded == 10000)
+    -- A pre-1.1 row has no debt metadata. Its original deposit is already in the bank.
+    assert(old.paidUp)
+    env.IsInGuild = function() return true end
+    ns.OnAddonMessage("KOS", peer.RowFor(old, true), "GUILD", "Member")
+    assert(ns.Entry(old.guid).paidUp, "Relaying a legacy deposit must not create a debt")
+    local oldFields = {}
+    for value in (unpaidRow .. "~"):gmatch("([^~]*)~") do oldFields[#oldFields + 1] = value end
+    oldFields[3] = tostring(e.stamp + 1)
+    send(table.concat(oldFields, "~", 1, 28), "Guildmate")
+    assert(not peer.Entry(e.guid).paidUp, "An old peer cannot clear an existing live bounty debt")
+    -- Observe the updated row on the manager's client before issuing the clearance.
+    ns.OnAddonMessage("KOS", peer.RowFor(peer.Entry(e.guid), true), "GUILD", "Member")
+    e = assert(ns.Entry(e.guid))
+    env.SlashCmdList.KILLONSIGHT("paidup Officer")
+    local cleared = ns.RowFor(e)
+    send(cleared, "Guildmate")
+    assert(not peer.Entry(e.guid).paidUp)
+    send(cleared)
+    shared = peer.Entry(e.guid)
+    assert(shared.paidUp and shared.clearedBy == "Officer" and shared.clearedAt == now)
+    local clearedStamp = shared.stamp
+    send(peer.RowFor(shared, true))
+    assert(peer.Entry(e.guid).stamp == clearedStamp)
+    -- A later digest from a member still running an unpaid copy must preserve the payment.
+    local replay = unpaidRow:gsub("^(E~[^~]+~)%d+~", "%1" .. tostring(shared.stamp + 10) .. "~")
+    send(replay, "Guildmate")
+    assert(peer.Entry(e.guid).paidUp and peer.Entry(e.guid).clearedAt == now)
+    assert(ns.ClaimKill(e.guid, "Hunter"))
+    assert(not ns.ClaimKill(e.guid, "Hunter"))
+    local scope = ns.Store()
+    assert(e.paid and #scope.board.ledger == 1)
+    assert(scope.bank.pool == 7000 and scope.bank.cut == 3000 and scope.bank.paid == 0)
+    assert(not peer.reported)
+end
+sharedBounty()
+
 local function board()
     local player = {realm = "Fixture", name = "Alpha", faction = "Alliance", rank = "Valar", rankIndex = 1}
-    local oldEntry = {kills = 3, funded = 45000, want = 70000}
+    local oldEntry = {kills = 3, funded = 45000, want = 70000, fundedBy = "LegacyPayer", fundedAt = 1799900000}
+    local pending = {name = "Pending", job = true, want = 30000, funded = 0}
     local paid = {kills = 4, funded = 50000, want = 90000, paid = true}
     local stored = {welcomeAck = true, share = false, minimap = false, cutPercent = 10, defaultReward = 50000,
-        scopes = {Legacy = {entries = {oldEntry, paid}}, Earlier = {entries = 42}}}
+        scopes = {Legacy = {entries = {oldEntry, paid, pending}}, Earlier = {entries = 42}}}
     local env, load, event, messages = client(player, {kos = stored})
     local ns = load("KillOnSight")
     event("ADDON_LOADED", addon)
-    assert(not ns.reported and stored.v140Migrated and stored.v146Migrated and stored.v147Migrated)
-    assert(stored.defaultReward == 30000 and stored.cutPercent == 30 and stored.minimap == false and stored.share == false)
-    assert(oldEntry.want == 45000 and paid.want == 90000)
+    assert(not ns.reported and stored.v140Migrated and stored.v146Migrated and stored.v147Migrated and stored.v120Migrated)
+    assert(stored.defaultReward == 10000 and stored.cutPercent == 30 and stored.minimap == false and stored.share == false)
+    assert(oldEntry.want == 10000 and oldEntry.funded == 10000 and oldEntry.paidUp)
+    assert(paid.want == 90000 and paid.funded == 50000)
+    assert(not pending.job and pending.funded == 0 and pending.want == 10000)
     local command = env.SlashCmdList.KILLONSIGHT
     command("cut 35"); command("refunddays 20"); command("reward 1.2345")
     assert(stored.defaultReward == 12345)
@@ -332,29 +418,29 @@ local function board()
     assert(entries["n:large"].want == 100000000)
     command("add Excess 10001")
     assert(entries["n:excess"] == nil)
-    -- A player arms a separate board entry, then the client reports two bank updates.
     local balance = 100000
     env.GetGuildBankMoney = function() return balance end
+    local regular = entries["n:regular"]
+    player.rank, player.rankIndex = "Member", 5
     command("fund Regular")
-    assert(entries["n:regular"].job and entries["n:regular"].funded == 0)
+    assert(regular.want == 10000 and regular.funded == 10000 and regular.fundedBy == "Alpha")
+    assert(not regular.paidUp and #ns.Ious() == 1)
+    command("bounty Regular")
     balance = balance + 10000
     event("GUILDBANK_UPDATE_MONEY")
-    assert(entries["n:regular"].funded == 0 and ns.Store().bank.escrowed == 0)
-    balance = balance + 2500
-    event("GUILDBANK_UPDATE_MONEY")
-    assert(entries["n:regular"].funded == 12345 and ns.Store().bank.escrowed == 12500 and ns.Store().bank.float == 155)
-    event("GUILDBANK_UPDATE_MONEY")
-    assert(ns.Store().bank.escrowed == 12500 and not ns.reported)
-    command("add Partial 1")
-    command("fund Partial")
-    balance = balance + 5000
     command("deposited")
-    event("GUILDBANK_UPDATE_MONEY")
-    assert(entries["n:partial"].funded == 0)
-    balance = balance + 5000
-    command("deposited")
-    event("GUILDBANK_UPDATE_MONEY")
-    assert(entries["n:partial"].funded == 10000 and ns.Store().bank.escrowed == 22500)
+    assert(#ns.Ious() == 1 and ns.Store().bank.escrowed == 0)
+    command("paidup Alpha")
+    assert(not regular.paidUp and ns.DebtLedger()[1].status == "owes bank")
+    player.rank, player.rankIndex = "Valar", 1
+    command("paidup Alpha")
+    local ledger = ns.DebtLedger()
+    assert(#ns.Ious() == 0 and #ledger == 1 and ledger[1].status == "paid up")
+    assert(ledger[1].amount == 10000 and ledger[1].when == 1800000000 and ledger[1].by == "Alpha")
+    local auditAfterPayment = #ns.Store().audit
+    assert(auditAfterPayment == 1 and regular.paidUp)
+    command("paidup Alpha")
+    assert(#ns.Store().audit == auditAfterPayment)
     ns.ui.selected = target
 
     for _, cmd in ipairs({"bounty", "fund", "remove", "where"}) do
@@ -370,7 +456,7 @@ local function board()
     player.rank, player.rankIndex = "Valar", 1
     command("remove") -- An omitted name deliberately selects the highlighted row.
     assert(entries["n:fixturerival"] == nil and ns.ui.selected == nil)
-    assert(ns.Store().removed[target.guid] and #ns.Store().audit == 1)
+    assert(ns.Store().removed[target.guid] and #ns.Store().audit == auditAfterPayment + 1)
     env.os, env.date = false, os.date
     command("log")
     assert(messages[#messages]:find(os.date("!%Y-%m-%d %H:%M", 1800000000), 1, true))
@@ -381,6 +467,7 @@ local function board()
     local reloaded = reload("KillOnSight")
     login("ADDON_LOADED", addon)
     assert(not reloaded.reported and reloaded.Store().entries["n:other"].want == 1)
+    assert(reloaded.DebtLedger()[1].status == "paid up" and #reloaded.Ious() == 0)
     assert(stored.cutPercent == 35 and stored.defaultReward == 12345 and stored.refundDays == 20)
     local scope = reloaded.Store()
     scope.bank.pool, scope.bank.paid = 7000, 3500
@@ -394,7 +481,7 @@ local function board()
     assert(next(kept.entries) == nil and next(kept.removed) == nil)
     assert(kept.bank.pool == 7000 and kept.bank.paid == 3500)
     assert(kept.board.ledger[1].who == "Alpha" and kept.board.award.amount == 3500)
-    assert(#kept.audit == 1)
+    assert(#kept.audit == auditAfterPayment + 1)
     env2.SlashCmdList.KILLONSIGHT("share")
     assert(stored.share == true)
 end
