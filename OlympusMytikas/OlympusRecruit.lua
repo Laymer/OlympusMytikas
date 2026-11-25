@@ -12,7 +12,7 @@
 --   /om why             what the client last blocked
 --   /om minimap         minimap button on/off
 --   /om profile         which character the settings belong to
---   /om reset           reset this character and clear the shared custom ads
+--   /om reset           this character back to defaults (custom ads too)
 --
 -- RIGHT CLICK A PLAYER and there is "Invite to <guild>": on their portrait (target,
 -- party, raid) and on their name in chat, the Who list and the friends list. Added
@@ -76,8 +76,8 @@ local ADS = {
 	"<Olympus Mytikas> We raid like people with jobs, not like gods with worshippers. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> The mountain doesn't make gods. It makes regulars. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> Highest peak on Olympus. We need climbers, not tourists. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
-	"<Olympus Mytikas> THE SUMMIT IS CLAIMED IN BLOOD! Join our ranks, crush our enemies, and carve your legend into Azeroth. Steel in hand. Thunder in our hearts. No surrender. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
-	"<Olympus Mytikas> Is Recruiting! This is Peak Olympus! Join for the events, the banter, and the shared disdain for the Red Menace. Every race and class is welcome on Olympus. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
+	"<Olympus Mytikas> THE SUMMIT IS CLAIMED IN BLOOD! Join our ranks, crush our enemies, and carve your legend into Azeroth. Steel in our hands. Thunder in our hearts. No mercy. No surrender. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
+	"<Olympus Mytikas> Is Recruiting! This is Peak Olympus! Join for the events, the banter, and the shared disdain for the Red Menace. Other guilds discriminate based on Race and Class, but here you are an Equal. Here: You're an Olympian. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> They say we want everyone on this server in the guild. They are right and you are behind schedule. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> They call it mass recruitment spam. We call it a queue. Read the ad, join the queue. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
 	"<Olympus Mytikas> They built an addon to mute us. Install it. We will still be raiding. Raids, PVP, Dungeons. Community built at the top. Whisper me for an invite.",
@@ -148,10 +148,10 @@ end
 local dbCache
 
 local function EnsureDB()
-	if type(OlympusRecruitDB) ~= "table" then OlympusRecruitDB = {} end
+	OlympusRecruitDB = OlympusRecruitDB or {}
 	local g = OlympusRecruitDB
 	for k, v in pairs(DEFAULTS) do
-		if g[k] == nil or (type(v) == "table" and type(g[k]) ~= "table") then
+		if g[k] == nil then
 			if type(v) == "table" then
 				local t = {}
 				for i = 1, #v do t[i] = v[i] end
@@ -168,9 +168,9 @@ local function EnsureDB()
 
 	local p
 	if key then
-		if type(g.chars) ~= "table" then g.chars = {} end
+		g.chars = g.chars or {}
 		p = g.chars[key]
-		if type(p) ~= "table" then
+		if not p then
 			-- first time this character is seen since the update: keep whatever it
 			-- was using, so nothing changes under the player
 			p = {}
@@ -234,7 +234,7 @@ local function AddAd(text)
 		tagged = true
 	end
 	if #text > AD_LIMIT then
-		return nil, "too long: " .. #text .. " bytes, the limit is " .. AD_LIMIT
+		return nil, "too long: " .. #text .. " characters, the limit is " .. AD_LIMIT
 	end
 	local db = EnsureDB()
 	db.custom = db.custom or {}
@@ -251,7 +251,7 @@ local function DelAd(n)
 	local db = EnsureDB()
 	db.custom = db.custom or {}
 	local first = #ADS + 1
-	if not n or n ~= math.floor(n) then return false, "choose a whole-number ad position" end
+	if not n then return false, "no ad selected" end
 	if n < first or n > #ADS + #db.custom then
 		return false, "only your own ads (number " .. first .. " and up) can be deleted"
 	end
@@ -292,7 +292,7 @@ local function PostAll(forceIndex, quiet)
 		return
 	end
 
-	local p = { text = msg, channels = {}, sent = 0, seen = 0 }
+	local p = { texts = { [msg] = true }, sent = 0, seen = 0 }
 	pending = p
 
 	-- THE POST: both channels, one pass, nothing between them
@@ -306,7 +306,6 @@ local function PostAll(forceIndex, quiet)
 	-- The client echoes our own post back through CHAT_MSG_CHANNEL, and that echo
 	-- is the only proof it landed. Reading events is not restricted, so this can
 	-- wait; sending from here would be, which is what the old code got wrong.
-	if type(C_Timer) ~= "table" or type(C_Timer.After) ~= "function" then return idx end
 	C_Timer.After(ECHO_WAIT + 1, function()
 		if pending ~= p or quiet then return end
 		if p.sent < 2 then
@@ -1161,16 +1160,8 @@ frame:SetScript("OnEvent", function(_, event, ...)
 	end
 	if event == "CHAT_MSG_CHANNEL" then
 		-- our own post comes back through here; that is the only proof it landed
-		local text, sender = ...
-		local channel = select(8, ...)
-		if Secret(text, sender, channel) or not pending or pending.text ~= text then return end
-		if channel ~= SLOT_GENERAL and channel ~= SLOT_TRADE then return end
-		local name = UnitName("player")
-		local realm = GetRealmName()
-		if Secret(name, realm) or not name then return end
-		local fullName = realm and name .. "-" .. realm:gsub("%s+", "")
-		if (sender == name or sender == fullName) and not pending.channels[channel] then
-			pending.channels[channel] = true
+		local text = ...
+		if pending and pending.texts[text] then
 			pending.seen = pending.seen + 1
 		end
 		return
@@ -1200,7 +1191,7 @@ local function Help()
 	Say("/om ui - open the window; type your own ad in the box there")
 	Say("/om - post a random ad to /1 General and /2 Trade")
 	Say("/om list | pick <n> | test")
-	Say("/om add <text> | del <n> | reset (clears shared custom ads)")
+	Say("/om add <text> | del <n> | reset")
 	Say("/om invite <name> - the guild invite command, ready to copy")
 	Say("/om why - what the client last blocked")
 	Say("/om minimap - minimap button on/off")
@@ -1327,7 +1318,7 @@ local function Handle(msg)
 		d.lastPick = 0
 		d.minimap = true
 		d.minimapAngle = DEFAULTS.minimapAngle
-		Say("this character is back to defaults; the shared custom ads were cleared")
+		Say("wiped - this character is back to defaults, custom ads gone")
 		Say("posts still go to /1 General and /2 Trade")
 
 	elseif cmd == "profile" or cmd == "char" then

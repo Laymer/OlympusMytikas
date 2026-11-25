@@ -66,7 +66,6 @@ local PREFIX = ns.PREFIX
 local DEATH_WINDOW = 5
 local MSG_MAX = 250
 local CHUNK = 210
-local MAX_PARTS = 40
 local SEND_INTERVAL = 1.2
 local RETRY_WAIT = { 2, 4, 8, 15, 30 }
 local HELLO_EVERY = 600
@@ -156,8 +155,8 @@ end
 -- ends even when a PC clock is wrong. A guarded fallback keeps an odd client from breaking onboard.
 function Board.BoardMonth(at)
 	at = math.floor(tonumber(at) or 0)
-	if at > 0 and type(date) == "function" then
-		local ok, value = pcall(date, "!%Y-%m", at)
+	if at > 0 and type(os) == "table" and type(os.date) == "function" then
+		local ok, value = pcall(os.date, "!%Y-%m", at)
 		if ok and type(value) == "string" and value:match("^%d%d%d%d%-%d%d$") then return value end
 	end
 	return "unknown"
@@ -311,7 +310,6 @@ end
 -- Only the guild master and the Valar rank may remove rows or clear what the bank owes. Everybody
 -- else can still add a name, fund a bounty, announce it and read the board. These live on Board
 -- rather than as more top-level locals (Lua 5.1's main chunk is at its 200-local ceiling).
-Board.MAX_COPPER = 100000000
 Board.MANAGER_RANK = "Valar"
 Board.DENIED = "only the guild master or " .. Board.MANAGER_RANK ..
 	" can remove entries or clear what the bank owes"
@@ -390,28 +388,48 @@ local function Init()
 	end
 	if type(db.scopes) ~= "table" then db.scopes = {} end
 	if type(db.bank) ~= "table" then db.bank = {} end
-	-- Pending deposits from older clients become unfunded names. Preserve settled amounts and
-	-- the corresponding ledger records when migrating an existing profile to live 1g bounties.
-	if not db.v120Migrated and tonumber(db.defaultReward) == 30000 then db.defaultReward = DEFAULT_REWARD end
-	for _, scope in pairs(db.scopes) do
-		local entries = type(scope) == "table" and scope.entries
-		for _, e in pairs(type(entries) == "table" and entries or {}) do
-			if type(e) == "table" and not db.v120Migrated and (tonumber(e.funded) or 0) > 0 and e.paidUp == nil then
-				-- Funding on a deposit-based client required gold already in the bank.
-				e.paidUp, e.legacyDeposit = true, true
-			end
-			if type(e) == "table" and not e.paid and not e.refunded and not e.refundDue then
+	-- 1.2.0: flat 1g bounties, live on request. Old 3g asks move to 1g; a previously pending job
+	-- keeps its name on the board but is no longer a half-state, and any live bounty now records a
+	-- debt owed by the requester until a manager marks it paid.
+	if not db.v120Migrated then
+		if tonumber(db.defaultReward) == 30000 then db.defaultReward = 10000 end
+		for _, scope in pairs(db.scopes) do
+			for _, e in pairs(type(scope) == "table" and scope.entries or {}) do
 				e.job = nil
-				if (tonumber(e.funded) or 0) > 0 then
-					e.want, e.funded = DEFAULT_REWARD, DEFAULT_REWARD
-				elseif not db.v120Migrated then
+				if not e.paid and not e.refunded then
 					e.want = DEFAULT_REWARD
+					if (tonumber(e.funded) or 0) > 0 then
+						e.funded = DEFAULT_REWARD
+						e.paidUp = false
+					end
 				end
 			end
 		end
+		db.v120Migrated = true
 	end
-	db.killBonus = 0
-	db.v146Migrated, db.v120Migrated = true, true
+	-- One-time move to a flat ask: every bounty is 3g, with no +5g for further kills.
+	if not db.v146Migrated then
+		db.killBonus = 0 -- left in old profiles only; never read again
+		local ask = tonumber(db.defaultReward) or DEFAULT_REWARD
+		for _, scope in pairs(db.scopes) do
+			for _, e in pairs(type(scope) == "table" and scope.entries or {}) do
+				if (tonumber(e.kills) or 0) > 1 and not e.paid and not e.refunded then
+					e.want = math.max(ask, tonumber(e.funded) or 0)
+				end
+			end
+		end
+		db.v146Migrated = true
+	end
+	-- An old guildmate can replay a row with a 3g ask long after the one-time migration has run.
+	-- Keep the flat 1g rule on EVERY load, so a stale synced row can never put the old price back.
+	for _, scope in pairs(db.scopes) do
+		for _, e in pairs(type(scope) == "table" and scope.entries or {}) do
+			if (tonumber(e.want) or 0) > DEFAULT_REWARD then e.want = DEFAULT_REWARD end
+			if (tonumber(e.funded) or 0) > DEFAULT_REWARD and not e.paid and not e.refunded then
+				e.funded = DEFAULT_REWARD
+			end
+		end
+	end
 	clock = tonumber(db.clock) or 0
 	return db
 end
@@ -633,8 +651,6 @@ local function RowFor(e, quiet)
 		e.layerNew and "1" or "0",
 		-- field 36: the time of the last kill. The board sorts by this, not by when a sync arrived.
 		tostring(math.floor(tonumber(e.killAt) or tonumber(e.at) or 0)),
-		-- Older clients ignore this provenance field. Modern relays retain pre-1.1 deposits.
-		e.legacyDeposit and (tonumber(e.funded) or 0) > 0 and "1" or "0",
 	}, "~")
 end
 
@@ -645,33 +661,20 @@ local function Fields(row)
 	return out
 end
 
-function Board.TargetID(value)
-	if type(value) == "string" and value:sub(1, 2) == "n:" then
-		local name = value:sub(3)
-		if name ~= "" and name == Clean(name, MAX_NAME):lower() then return value end
-	end
-	return Guid(value)
-end
-
 local function ParseEntry(row)
 	local f = Fields(row)
 	if f[1] ~= "E" then return nil end
-	local guid = Board.TargetID(f[2])
-	if not guid or (guid:sub(1, 2) == "n:" and guid ~= "n:" .. Clean(f[9], MAX_NAME):lower()) then return nil end
+	local guid = Guid(f[2])
+	if not guid then return nil end
 	local stamp = Num(f[3], 0, 4294967295)
 	if not stamp then return nil end
-	local funded = Num(f[5], 0, Board.MAX_COPPER) or 0
-	local want = Num(f[4], 0, Board.MAX_COPPER) or 0
-	local settled = f[7] == "1" or f[7] == "2" or f[7] == "3"
-	if not settled then
-		if funded > 0 then funded = DEFAULT_REWARD end
-		if funded > 0 or not f[36] then want = DEFAULT_REWARD end
-	end
-	local legacyDeposit = funded > 0 and (not f[29] or f[37] == "1")
 	local e = {
 		guid = guid,
 		stamp = stamp,
-		want = want, funded = funded,
+		-- Field 4 is kept on the wire for older clients, but this build asks a flat 1g: never let a
+		-- replayed 3g row set the price, and never let an old 3g deposit show as a 3g live bounty.
+		want = DEFAULT_REWARD,
+		funded = math.min(Num(f[5], 0, 100000000) or 0, DEFAULT_REWARD),
 		kills = Num(f[6], 0, 9999) or 0,
 		paid = f[7] == "1",
 		refunded = f[7] == "2",
@@ -691,9 +694,7 @@ local function ParseEntry(row)
 		refundedTo = Clean(f[20], 24),
 		refundedAt = Num(f[21], 0, 4294967295) or 0,
 		refundDays = Num(f[22], 0, 365) or 0,
-		-- The previous format ended at field 28 and used field 23 for a pending deposit.
-		legacyDeposit = legacyDeposit,
-		paidUp = legacyDeposit or (f[29] ~= nil and f[23] == "1"),
+		paidUp = f[23] == "1",
 		clearedAt = Num(f[31], 0, 4294967295) or 0,
 		clearedBy = Clean(f[32], 24) or "",
 		reborn = Num(f[33], 0, 4294967295) or 0,
@@ -749,7 +750,7 @@ local function SendFn()
 end
 
 local function CanSend()
-	if not ns.Enabled() or DB().share == false then return false end
+	if DB().share == false then return false end
 	if not SendFn() then return false end
 	return Ask(IsInGuild) == true
 end
@@ -757,14 +758,19 @@ end
 local function QueueParts(payload, urgent)
 	-- One payload is one chunk set: every part must carry the SAME id or the receiver files each part
 	-- under its own set and never assembles any of them.
-	if #payload <= MSG_MAX then
-		queue[#queue + 1] = payload
-	else
+	local cid
+	if #payload > MSG_MAX then
 		chunkID = (chunkID + 1) % 1000
-		local count = math.ceil(#payload / CHUNK)
-		for index = 1, count do
-			local body = payload:sub((index - 1) * CHUNK + 1, index * CHUNK)
-			queue[#queue + 1] = ("C%d:%d:%d:%s"):format(chunkID, index, count, body)
+		cid = chunkID
+	end
+	for i = 1, #payload, CHUNK do
+		local body = payload:sub(i, i + CHUNK - 1)
+		if not cid then
+			queue[#queue + 1] = body
+		else
+			local count = math.ceil(#payload / CHUNK)
+			local index = math.floor(i / CHUNK) + 1
+			queue[#queue + 1] = ("C%d:%d:%d:%s"):format(cid, index, count, body)
 		end
 	end
 	while #queue > MAX_QUEUE do table.remove(queue, 1) end
@@ -816,7 +822,7 @@ end
 -- GM/Valar, so a plain member cannot write or forge shared history.
 Board.AUDIT_MAX = 200
 Board.AUDIT_DIGEST = 20
-Board.AUDIT_LABELS = { R = "removed", F = "refund decided", H = "handed back", P = "prize paid", U = "cleared debt" }
+Board.AUDIT_LABELS = { R = "removed", F = "refund decided", H = "handed back", P = "prize paid" }
 
 function Board.AuditRow(rec)
 	if type(rec) ~= "table" then return nil end
@@ -872,7 +878,7 @@ function Board.LogPrint()
 	Say("|cffffd100audit log|r - newest first (shared with GM and " .. Board.MANAGER_RANK .. " only):")
 	for i = 1, math.min(#audit, 15) do
 		local r = audit[i]
-		local ok, when = pcall(date, "!%Y-%m-%d %H:%M", tonumber(r.at) or 0)
+		local ok, when = pcall(os.date, "!%Y-%m-%d %H:%M", tonumber(r.at) or 0)
 		if not ok then when = tostring(r.at) end
 		Say("%s  %s %s %s%s", tostring(when), r.who, Board.AUDIT_LABELS[r.action] or r.action,
 			r.target, r.detail ~= "" and (" - " .. r.detail) or "")
@@ -1068,7 +1074,7 @@ function Board.ParseBoardRow(row)
 	if f[2] ~= "C" then return nil end
 	local who = Clean(f[3], MAX_NAME)
 	local target = Guid(f[4])
-	local amount = Num(f[6], 1, Board.MAX_COPPER)
+	local amount = Num(f[6], 1, 100000000)
 	if who == "" or not target or not amount then return nil end
 	return { kind = "C", who = who, target = target, tname = Clean(f[5], MAX_NAME),
 		amount = amount, at = at }
@@ -1171,42 +1177,24 @@ function Board.BoardWinner(month)
 	return Board.BoardRanks(month)[1]
 end
 
-function Board.ArchiveMonth(b, month, now)
-	local winner = Board.BoardWinner(month)
-	if winner then
-		local h = { month = month, who = winner.who, count = winner.count,
-			amount = winner.amount, prize = Board.FundForMonth(month),
-			paid = false, by = "", at = math.floor(tonumber(now) or 0) }
-		local a = b.award
-		if a.month == month and SameName(a.who, winner.who) then
-			h.paid, h.by = true, a.by
-		end
-		b.history[#b.history + 1] = h
-		while #b.history > 12 do table.remove(b.history, 1) end
-	end
-end
-
 function Board.BoardRollover(now)
 	local b = Store().board
 	local month = Board.BoardMonth(now)
-	if month == "unknown" then return false end
 	if b.month == month then return false end
-	local closed = {}
-	if b.month == "unknown" or b.month == "" then
-		for _, rec in ipairs(b.ledger) do
-			if rec.month == "unknown" then
-				rec.month = Board.BoardMonth(rec.at)
-				rec.key = rec.month .. "|" .. rec.who:lower() .. "|" .. rec.target
+	if b.month ~= "" and b.month ~= "unknown" then
+		local winner = Board.BoardWinner(b.month)
+		if winner then
+			local h = { month = b.month, who = winner.who, count = winner.count,
+				amount = winner.amount, prize = Board.FundForMonth(b.month),
+				paid = false, by = "", at = math.floor(tonumber(now) or 0) }
+			local a = b.award
+			if a.month == b.month and SameName(a.who, winner.who) then
+				h.paid, h.by = true, a.by
 			end
-			if rec.month ~= "unknown" and rec.month < month then closed[rec.month] = true end
+			b.history[#b.history + 1] = h
+			while #b.history > 12 do table.remove(b.history, 1) end
 		end
-	elseif b.month < month then
-		closed[b.month] = true
 	end
-	local ordered = {}
-	for past in pairs(closed) do ordered[#ordered + 1] = past end
-	table.sort(ordered)
-	for _, past in ipairs(ordered) do Board.ArchiveMonth(b, past, now) end
 	b.month = month
 	local keep = {}
 	for i = 1, #b.ledger do
@@ -2249,17 +2237,7 @@ local function SendDigest(urgent)
 		end
 	end
 	if #rows == 0 then return false end
-	local batch, bytes = {}, 0
-	for _, row in ipairs(rows) do
-		-- Keep a set below the 1.0.1 peer timeout (30s at 1.2s per frame).
-		if bytes + #row + 1 > 20 * CHUNK then
-			QueueParts(table.concat(batch, ";"), urgent)
-			batch, bytes = {}, 0
-		end
-		batch[#batch + 1] = row
-		bytes = bytes + #row + (#batch > 1 and 1 or 0)
-	end
-	QueueParts(table.concat(batch, ";"), urgent)
+	QueueParts(table.concat(rows, ";"), urgent)
 	return true
 end
 
@@ -2295,7 +2273,6 @@ local function Fund(entry)
 	e.funded = amount
 	e.fundedBy = MyName()
 	e.fundedAt = Clock()
-	e.legacyDeposit, e.clearedAt, e.clearedBy = nil, nil, nil
 	e.cutPct = tonumber(DB().cutPercent) or 0
 	e.paidUp = false
 	Bump(e)
@@ -2362,11 +2339,8 @@ local function MergeRows(mine, theirs)
 	if (tonumber(theirs.killAt) or 0) > (tonumber(mine.killAt) or 0) then
 		merged.killAt, merged.at = theirs.killAt, theirs.killAt
 	end
-	merged.funded = math.max(mine.funded or 0, theirs.funded or 0)
-	merged.want = math.max(mine.want or 0, theirs.want or 0, merged.funded)
-	if merged.funded > 0 and not (mine.paid or theirs.paid or mine.refunded or theirs.refunded or mine.refundDue or theirs.refundDue) then
-		merged.want, merged.funded = DEFAULT_REWARD, DEFAULT_REWARD
-	end
+	merged.want = DEFAULT_REWARD
+	merged.funded = math.min(math.max(mine.funded or 0, theirs.funded or 0), DEFAULT_REWARD)
 	merged.paid = mine.paid or theirs.paid
 	merged.refunded = mine.refunded or theirs.refunded
 	merged.refundDue = mine.refundDue or theirs.refundDue
@@ -2425,42 +2399,13 @@ local function ApplyEntry(remote)
 	-- however new its stamp looks on another clock. Only a fresh add (reborn > the delete) can.
 	local tomb = tonumber(s.removed[remote.guid]) or 0
 	if tomb > 0 and (tonumber(remote.reborn) or 0) <= tomb then return false end
-	local alias = "n:" .. remote.name:lower()
 	local mine = s.entries[remote.guid]
-	local loose = alias ~= remote.guid and s.entries[alias]
-	if alias ~= remote.guid then
-		local aliasTomb = tonumber(s.removed[alias]) or 0
-		-- Previous clients wrote an alias tombstone when promoting a row to a real GUID.
-		if not mine and aliasTomb > 0 and (remote.reborn or 0) <= aliasTomb then return false end
-		if loose and (loose.stamp > remote.stamp or (loose.reborn or 0) > (remote.reborn or 0)) then return false end
-	else
-		-- The GUID row supersedes its off-screen alias, including delayed copies of that alias.
-		for guid, resolved in pairs(s.entries) do
-			if Guid(guid) and resolved.name:lower() == remote.name:lower() then return false end
-		end
-	end
-	mine = mine or loose
-	local fresh = not mine
-	local legacyDeposit = remote.legacyDeposit
+	local fresh = mine == nil
 	if mine then
-		if remote.stamp < mine.stamp or (remote.reborn or 0) < (mine.reborn or 0) then return false end
-		-- A later digest from an older client may omit the manager's clearance of this debt.
-		-- A different funding request (even against the same target) starts its own debt.
-		local sameRequest = (mine.funded or 0) > 0 and remote.funded > 0
-			and (remote.fundedBy == mine.fundedBy or (legacyDeposit and remote.fundedBy == ""))
-			and (remote.fundedAt == mine.fundedAt or (legacyDeposit and remote.fundedAt == 0))
-		if sameRequest and (legacyDeposit or (mine.paidUp and (mine.clearedAt or 0) >= (remote.clearedAt or 0))) then
-			remote.paidUp, remote.clearedAt, remote.clearedBy = mine.paidUp, mine.clearedAt, mine.clearedBy
-			remote.fundedBy, remote.fundedAt = mine.fundedBy, mine.fundedAt
-			remote.legacyDeposit = mine.legacyDeposit
-		end
+		if remote.stamp < mine.stamp then return false end
 		if remote.stamp == mine.stamp then
-			local before = RowFor(mine, true)
 			local merged = MergeRows(mine, remote)
-			merged.guid = remote.guid
 			KeepLocalProof(merged)
-			if RowFor(merged, true) == before then return false end
-			if loose then s.entries[alias] = nil end
 			Bump(merged)
 			s.entries[remote.guid] = merged
 			Broadcast(merged, true)
@@ -2477,15 +2422,13 @@ local function ApplyEntry(remote)
 	remote.auto = false
 	remote.src = "shared"
 	KeepLocalProof(remote)
-	if loose then s.entries[alias] = nil end
 	s.entries[remote.guid] = remote
 	-- A newly shared row can carry a last-known spot. Without this the pin ticker sees nothing
 	-- dirty and a guildmate's map stays empty until he reloads or runs /kos pins by hand.
 	if remote.spot then MapLib.pinDirty = true end
 	-- A row arriving already funded must put its skull up on this client straight away.
 	if ns.RefreshMarks then pcall(ns.RefreshMarks) end
-	s.removed[remote.guid] = nil
-	s.removed[alias] = nil
+	if tomb > 0 then s.removed[remote.guid] = nil end
 	stats.applied = stats.applied + 1
 	if not remote.quiet then Notify(remote, fresh) end
 	Trim()
@@ -2496,7 +2439,7 @@ end
 local function ApplyRemoval(row, sender)
 	if not Board.CanManage(sender) then return false end
 	local f = Fields(row)
-	local guid = Board.TargetID(f[2])
+	local guid = Guid(f[2])
 	local stamp = Num(f[3], 0, 4294967295)
 	if not guid or not stamp then return false end
 	local s = Store()
@@ -2506,10 +2449,6 @@ local function ApplyRemoval(row, sender)
 	-- this client (reborn newer than the delete) outranks it, so an old R row cannot erase it.
 	if mine and (tonumber(mine.reborn) or 0) > stamp then return false end
 	s.entries[guid] = nil
-	if mine and Guid(guid) then
-		local alias = "n:" .. mine.name:lower()
-		s.removed[alias] = math.max(tonumber(s.removed[alias]) or 0, stamp)
-	end
 	if stamp > (tonumber(s.removed[guid]) or -1) then s.removed[guid] = stamp end
 	MapLib.pinDirty = true
 	if ns.RefreshMarks then pcall(ns.RefreshMarks) end
@@ -2533,9 +2472,6 @@ local function Handle(payload, sender)
 				if not Board.CanManage(sender) then
 					entry.refunded, entry.refundedBy = nil, nil
 					entry.refundedTo, entry.refundedAt = nil, nil
-					if not entry.legacyDeposit then
-						entry.paidUp, entry.clearedAt, entry.clearedBy = false, 0, ""
-					end
 				end
 				ApplyEntry(entry)
 			end
@@ -2566,7 +2502,6 @@ local function Handle(payload, sender)
 end
 
 local function OnAddonMessage(prefix, text, dist, sender)
-	if not ns.Enabled() then return end
 	if prefix ~= PREFIX then return end
 	if Secret(prefix, text, dist, sender) then return end
 	if type(text) ~= "string" or text == "" then return end
@@ -2577,18 +2512,12 @@ local function OnAddonMessage(prefix, text, dist, sender)
 	local id, index, count = text:match("^C(%d+):(%d+):(%d+):")
 	if id then
 		id, index, count = tonumber(id), tonumber(index), tonumber(count)
-		if not id or not index or not count or count < 1 or count > MAX_PARTS or index < 1 or index > count then return end
+		if not id or not index or not count or count < 1 or count > 40 or index < 1 or index > count then return end
 		local body = text:match("^C%d+:%d+:%d+:(.*)$") or ""
-		if type(sender) ~= "string" or sender == "" then return end
-		local key = sender .. ":" .. id
-		local now = Mono()
-		for oldKey, old in pairs(parts) do
-			if now - old.at > 30 then parts[oldKey] = nil end
-		end
-		local slot = parts[key]
-		if not slot or slot.count ~= count then
+		local slot = parts[id]
+		if not slot or slot.count ~= count or Mono() - slot.at > 30 then
 			slot = { count = count, got = {}, seen = 0, at = Mono() }
-			parts[key] = slot
+			parts[id] = slot
 		end
 		if not slot.got[index] then
 			slot.got[index] = body
@@ -2597,7 +2526,7 @@ local function OnAddonMessage(prefix, text, dist, sender)
 		if slot.seen == count then
 			local whole = {}
 			for i = 1, count do whole[i] = slot.got[i] or "" end
-			parts[key] = nil
+			parts[id] = nil
 			Handle(table.concat(whole), sender)
 		end
 		return
@@ -2619,17 +2548,12 @@ local function AddKill(guid, name, class, src, reason, spot, klevel, klayer)
 
 	local looseKey = "n:" .. name:lower()
 	local loose = s.entries[looseKey]
-	local aliasTomb = not s.entries[guid] and tonumber(s.removed[looseKey]) or 0
-	local tomb = math.max(tonumber(s.removed[guid]) or 0, aliasTomb)
-	if tomb > 0 and src ~= "manual" and (not loose or (loose.reborn or 0) <= tomb) then
-		return nil, "removed by a manager; use /kos add to add this name again"
-	end
-	if tomb > 0 then Observe(tomb) end
 	if loose then
 		s.entries[looseKey] = nil
 		if not s.entries[guid] then s.entries[guid] = loose end
 		if s.entries[guid] == loose then
 			loose.guid = guid
+			BroadcastRemoval(looseKey)
 		end
 	end
 
@@ -2677,17 +2601,15 @@ local function AddKill(guid, name, class, src, reason, spot, klevel, klayer)
 		end
 	end
 	ns.RememberKillerInfo(guid, e.klevel, e.klayer, e.klayerAt, e.layerNew)
-	e.want = (tonumber(e.funded) or 0) > 0 and e.funded or tonumber(DB().defaultReward) or DEFAULT_REWARD
+	e.want = math.max(tonumber(DB().defaultReward) or 0, tonumber(e.funded) or 0)
 	e.cutPct = tonumber(e.cutPct) or tonumber(DB().cutPercent) or 0
 	e.reason = Clean(reason or (src == "manual" and ("added by " .. me) or ("killed " .. me)), MAX_REASON)
 	AddUnique(e.victims, me, MAX_VICTIMS)
 	Bump(e)
 	-- A name added again is a new life for this guid. The birth stamp travels on the row so every
 	-- client can clear its delete marker; an old copy without it stays deleted.
-	if tomb > 0 then
-		if src == "manual" then e.reborn = e.stamp end
-		s.removed[guid], s.removed[looseKey] = nil, nil
-	end
+	e.reborn = e.stamp
+	if s.removed[guid] then s.removed[guid] = nil end
 	Trim()
 	Notify(e, e.kills == 1)
 	Broadcast(e, false)
@@ -2698,7 +2620,7 @@ end
 local PoolKill
 
 local function ClaimKill(guid, who)
-	local e = Entry(Guid(guid))
+	local e = Entry(guid)
 	if not e or e.paid then return false, "paid" end
 	who = Clean(who or MyName(), MAX_NAME)
 	if (tonumber(e.funded) or 0) <= 0 then
@@ -3112,11 +3034,6 @@ local function Remove(guid, force)
 	clock = base
 	DB().clock = clock
 	s.removed[guid] = base
-	local alias = "n:" .. e.name:lower()
-	if guid ~= alias then
-		s.entries[alias], s.removed[alias] = nil, base
-		BroadcastRemoval(alias)
-	end
 	Board.Audit("R", MyName(), e.name, StateText(e) .. ", funded " .. Money(e.funded))
 	MapLib.pinDirty = true
 	BroadcastRemoval(guid)
@@ -3321,7 +3238,7 @@ local function CaptureDeath(serial)
 			local where = SpotLine(e)
 			local info = ns.KillerLine(e)
 			Notice("%s killed you - added to the kill on sight list (a bounty asks for %s, live as soon as you request it).%s Where you were killed: %s",
-				e.name, Money(DEFAULT_REWARD),
+				e.name, Money(tonumber(e.want) or 0),
 				info and (" Killer: " .. info .. ".") or "",
 				where or "no readable map point - /kos where shows what the client exposed")
 		elseif playerLike then
@@ -3984,7 +3901,7 @@ function ns.SelectKiller(d, speak)
 			line = ("already has a live %s bounty"):format(Money(e.funded))
 		else
 			line = ("no bounty yet - one asks for %s"):format(
-				Money(DEFAULT_REWARD))
+				Money(math.max(0, (tonumber(e.want) or 0) - (tonumber(e.funded) or 0))))
 		end
 		local info = ns.KillerLine(e) or ns.KillerLine(d)
 		Say("%s%s|r selected - %s%s. |cffffd100Right-click|r him to put up a live bounty; the gold is owed to the bank and a manager clears it with /kos paidup.",
@@ -4658,7 +4575,7 @@ function ns.ShowAdd()
 		end
 		label("name", -10)
 		f.nameBox = edit(-26)
-		label("board ask (live bounties cost 1g)", -56)
+		label("gold the bounty should ask for", -56)
 		f.rewardBox = edit(-72, 90)
 		label("why he is on the list", -100)
 		f.reasonBox = edit(-116)
@@ -4679,8 +4596,7 @@ function ns.ShowAdd()
 		cancel:SetScript("OnClick", function() f:Hide() end)
 		ui.addBox = f
 	end
-	local gold = ("%.4f"):format((tonumber(DB().defaultReward) or 0) / 10000)
-	f.rewardBox:SetText((gold:gsub("0+$", ""):gsub("%.$", "")))
+	f.rewardBox:SetText(tostring(math.floor((tonumber(DB().defaultReward) or 0) / 10000)))
 	f.nameBox:SetText("")
 	f.reasonBox:SetText("")
 	f:Show()
@@ -4688,30 +4604,23 @@ function ns.ShowAdd()
 	return f
 end
 
--- Use the same integer copper units that fit in a shared board entry.
-function Board.GoldToCopper(text)
-	local whole, fraction = text:match("^%s*(%d*)%.(%d*)%s*$")
-	if not whole then whole, fraction = text:match("^%s*(%d+)%s*$"), "" end
-	if not whole or (whole == "" and fraction == "") then return nil end
-	local amount = (tonumber(whole) or 0) * 10000 + tonumber((fraction .. "0000"):sub(1, 4))
-	if amount > Board.MAX_COPPER then return nil end
-	return amount
-end
-
-function Board.AddDraft(name, want, reason)
+function ns.AddFromBox()
+	local f = ui.addBox
+	if not f then return end
+	local name = Clean(f.nameBox:GetText(), MAX_NAME)
+	if name == "" then Say("type the player's name first.") return end
+	local gold = tonumber(((f.rewardBox:GetText() or ""):gsub("[^%d%.]", ""))) or (DEFAULT_REWARD / 10000)
+	local want = math.max(0, math.floor(gold * 10000))
+	local reason = Clean(f.reasonBox:GetText() or "", MAX_REASON)
+	if reason == "" then reason = "added by " .. MyName() end
 	local guid = GuidForName(name)
 	local e
-	if not guid then
-		for id, row in pairs(Store().entries) do
-			if Guid(id) and row.name:lower() == name:lower() then guid = id break end
-		end
-	end
 	if guid then
 		e = AddKill(guid, name, ClassFromGUID(guid), "manual", reason)
 		if e then
 			e.kills = math.max(0, (tonumber(e.kills) or 1) - 1)
 			e.auto = false
-			e.want = (tonumber(e.funded) or 0) > 0 and e.funded or want
+			e.want = math.max(want, tonumber(e.funded) or 0)
 			Bump(e)
 			Broadcast(e, false)
 		end
@@ -4724,34 +4633,15 @@ function Board.AddDraft(name, want, reason)
 				at = Clock(), by = MyName(), src = "manual", reason = reason, victims = {}, claims = {}, paid = false }
 			s.entries[key] = e
 		else
-			e.want = (tonumber(e.funded) or 0) > 0 and e.funded or want
+			e.want = want
 			e.reason = reason
 		end
-		local tomb = s.removed[key]
-		if tomb then Observe(tomb) end
 		Bump(e)
-		if tomb then
-			e.reborn = e.stamp
-			s.removed[key] = nil
-		end
 		Broadcast(e, false)
 	end
-	return e
-end
-
-function ns.AddFromBox()
-	local f = ui.addBox
-	if not f then return end
-	local name = Clean(f.nameBox:GetText(), MAX_NAME)
-	if name == "" then Say("type the player's name first.") return end
-	local want = Board.GoldToCopper(f.rewardBox:GetText() or "")
-	if not want then Say("enter a gold amount from 0 to 10000.") return end
-	local reason = Clean(f.reasonBox:GetText() or "", MAX_REASON)
-	if reason == "" then reason = "added by " .. MyName() end
-	local e = Board.AddDraft(name, want, reason)
 	if e then
 		Say("%s added. |cffffd100/kos fund %s|r makes the %s bounty live at once; you owe the bank until a manager marks it paid.",
-			e.name, e.name, Money(DEFAULT_REWARD))
+			e.name, e.name, Money(math.max(0, tonumber(e.want) or 0)))
 	end
 	f:Hide()
 	refresh()
@@ -4823,8 +4713,7 @@ end
 
 -- ============================================================================ commands
 
-local function Find(input, useSelection)
-	if useSelection and not (input or ""):find("%S") then return ui.selected end
+local function Find(input)
 	input = Clean(input or "", MAX_NAME)
 	if input == "" then return nil end
 	local s = Store()
@@ -5020,27 +4909,46 @@ local function Handler(msg)
 	if cmd == "add" then
 		local name, gold, reason = rest:match("^(%S+)%s*(%S*)%s*(.*)$")
 		if not name then Say("usage: /kos add <name> [gold] [reason]") return end
-		local want = tonumber(DB().defaultReward) or 0
-		if gold ~= "" then
-			if gold:match("^[%d.+-]") then
-				want = Board.GoldToCopper(gold)
-				if not want then Say("enter a gold amount from 0 to 10000.") return end
-			else
-				reason = gold .. " " .. reason
-			end
-		end
+		local want = tonumber(gold) and math.max(0, math.floor(tonumber(gold) * 10000)) or (tonumber(DB().defaultReward) or 0)
 		local text = Clean(reason, MAX_REASON)
-		local e = Board.AddDraft(Clean(name, MAX_NAME), want, text ~= "" and text or ("added by " .. MyName()))
+		local e
+		local guid = GuidForName(name)
+		if guid then
+			e = AddKill(guid, name, ClassFromGUID(guid), "manual", text)
+			if e then
+				e.kills = math.max(0, (tonumber(e.kills) or 1) - 1)
+				e.auto = false
+				e.want = math.max(want, tonumber(e.funded) or 0)
+				Bump(e)
+				Broadcast(e, false)
+			end
+		else
+			local s = Store()
+			local key = "n:" .. Clean(name, MAX_NAME):lower()
+			e = s.entries[key]
+			if not e then
+				e = { guid = key, name = Clean(name, MAX_NAME), class = "", kills = 0, want = want, funded = 0,
+					auto = false, at = Clock(), by = MyName(), src = "manual",
+					reason = text ~= "" and text or ("added by " .. MyName()), victims = {}, claims = {}, paid = false }
+				s.entries[key] = e
+			else
+				e.want = want
+				if text ~= "" then e.reason = text end
+			end
+			Bump(e)
+			Broadcast(e, false)
+		end
 		if e then
 			Say("%s added. /kos fund makes a %s bounty live at once.",
-				e.name, Money(DEFAULT_REWARD))
+				e.name, Money(math.max(0, (tonumber(e.want) or 0) - (tonumber(e.funded) or 0))))
 		end
 		RefreshIfShown()
 		return
 	end
 
 	if cmd == "bounty" or cmd == "job" then
-		local e = Find(rest, true)
+		local e = Find(rest)
+		if not e then e = ui.selected end
 		if not e then Say("nobody called %q is on the board.", Clean(rest, MAX_NAME)) return end
 		local ok, why = ns.StartBounty(e, true)
 		if not ok then Say("%s", tostring(why)) end
@@ -5048,7 +4956,10 @@ local function Handler(msg)
 	end
 
 	if cmd == "fund" then
-		local e = Find(rest, true)
+		local e = Find(rest)
+		if not e then
+			if ui.selected then e = ui.selected end
+		end
 		if not e then Say("nobody called %q is on the board.", Clean(rest, MAX_NAME)) return end
 		local ok, _, why = StartJob(e, true)
 		if not ok then Say("%s", tostring(why)) end
@@ -5142,7 +5053,8 @@ local function Handler(msg)
 		local trimmed = name:match("^(.-)%s+force%s*$")
 		if trimmed then force, name = true, trimmed end
 		if name:lower() == "force" then force, name = true, "" end
-		local e = Find(name, true)
+		local e = Find(name)
+		if not e and ui.selected then e = ui.selected end
 		if not e then Say("nobody called %q is on the board.", Clean(name, MAX_NAME)) return end
 		local ok, why = Remove(e.guid, force)
 		if not ok then
@@ -5156,7 +5068,8 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "announce" then
-		local e = Find(rest, true)
+		local e = Find(rest)
+		if not e then e = ui.selected end
 		if not e then Say("nothing to announce yet.") return end
 		ns.FillKillerInfo(e)
 		Announce(e)
@@ -5185,10 +5098,10 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "reward" then
-		local amount = Board.GoldToCopper(rest)
-		if not amount then Say("usage: /kos reward <0-10000 gold>") return end
-		DB().defaultReward = amount
-		Say("default board ask: %s. Requesting a live bounty costs %s.", Money(amount), Money(DEFAULT_REWARD))
+		local gold = tonumber(rest)
+		if not gold or gold < 0 then Say("usage: /kos reward <gold>") return end
+		DB().defaultReward = math.floor(gold * 10000)
+		Say("a bounty now asks for %s - live as soon as somebody requests it.", Money(DB().defaultReward))
 		return
 	end
 	if cmd == "board" then
@@ -5321,7 +5234,7 @@ local function Handler(msg)
 		return
 	end
 	if cmd == "where" or cmd == "spot" then
-		local e = Find(rest, true)
+		local e = Find(rest) or ui.selected
 		if not e then
 			Say("nobody called %q is on the board - select an enemy first. Client map reads: %s",
 				Clean(rest, MAX_NAME), MapProbeLine())
@@ -5357,8 +5270,7 @@ local function Handler(msg)
 	if cmd == "recap" then RecapDump() return end
 	if cmd == "reset" then
 		local s = Store()
-		s.entries, s.removed = {}, {}
-		armed = nil
+		DB().scopes[Scope()] = { entries = {}, removed = {}, deaths = s.deaths or {}, ver = 1 }
 		ui.selected = nil
 		MapLib.pinDirty = true
 		Say("this realm's board is wiped (the guild death history is kept).")

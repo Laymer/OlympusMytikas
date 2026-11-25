@@ -11,7 +11,7 @@
 local ADDON = ...
 OlympusMytikasLoaded = true
 
-if type(OlympusMytikasDB) ~= "table" then OlympusMytikasDB = {} end
+OlympusMytikasDB = OlympusMytikasDB or {}
 if type(OlympusMytikasDB.minimap) ~= "boolean" then OlympusMytikasDB.minimap = true end
 if type(OlympusMytikasDB.minimapAngle) ~= "number" then OlympusMytikasDB.minimapAngle = 200 end
 -- The button used to slide on a fixed 80 px ring (angle only). The distance is
@@ -34,16 +34,11 @@ local hiddenChat = {}
 local HIDDEN_MAX = 50
 local wrappedCommands = {}
 
-local function IsSecret(value)
-	return type(issecretvalue) == "function" and issecretvalue(value)
-end
-
 local function StripColors(s)
-	return s:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+	return tostring(s or ""):gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
 end
 
 local function IsOlympusLocal(text)
-	if IsSecret(text) or type(text) ~= "string" then return false end
 	local s = StripColors(text):gsub("^%s+", "")
 	return s:match("^Olympus:") ~= nil
 		or s:match("^Olympus%s") ~= nil
@@ -76,12 +71,6 @@ local function ShouldWrapCommand(key)
 	return false
 end
 
-local function FinishCommand(ok, ...)
-	commandDepth = commandDepth - 1
-	if not ok then error((...), 0) end
-	return ...
-end
-
 local function WrapCommand(key)
 	if type(SlashCmdList) ~= "table" then return end
 	local fn = SlashCmdList[key]
@@ -89,7 +78,9 @@ local function WrapCommand(key)
 	local original = fn
 	SlashCmdList[key] = function(...)
 		commandDepth = commandDepth + 1
-		return FinishCommand(pcall(original, ...))
+		local ok, err = pcall(original, ...)
+		commandDepth = commandDepth - 1
+		if not ok then error(err, 0) end
 	end
 	wrappedCommands[key] = SlashCmdList[key]
 end
@@ -104,35 +95,19 @@ end
 local realPrint = print
 if type(realPrint) == "function" then
 	print = function(...)
-		local first = ...
-		if commandDepth > 0 or IsSecret(first) or type(first) ~= "string" then return realPrint(...) end
 		local n = select("#", ...)
-		if not IsOlympusLocal(n > 1 and first .. " " or first) then return realPrint(...) end
-		local parts = { first }
-		for i = 2, n do
-			local value = select(i, ...)
-			if IsSecret(value) then return realPrint(...) end
-			-- Objects may implement their own conversion in the game's print function.
-			local kind = type(value)
-			if kind ~= "string" and kind ~= "number" and kind ~= "boolean" and kind ~= "nil" then
-				return realPrint(...)
-			end
-			parts[i] = tostring(value)
-		end
-		RecordHidden(table.concat(parts, " "))
+		local parts = {}
+		for i = 1, n do parts[i] = tostring((select(i, ...))) end
+		local text = table.concat(parts, " ")
+		if commandDepth == 0 and IsOlympusLocal(text) then RecordHidden(text) return end
+		return realPrint(...)
 	end
 end
 
 if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
 	local realAddMessage = DEFAULT_CHAT_FRAME.AddMessage
 	DEFAULT_CHAT_FRAME.AddMessage = function(self, text, ...)
-		if commandDepth == 0 and IsOlympusLocal(text) then
-			for i = 1, select("#", ...) do
-				if IsSecret((select(i, ...))) then return realAddMessage(self, text, ...) end
-			end
-			RecordHidden(text)
-			return
-		end
+		if commandDepth == 0 and IsOlympusLocal(text) then RecordHidden(text) return end
 		return realAddMessage(self, text, ...)
 	end
 end
@@ -184,11 +159,9 @@ local shell, content, tabRecruit, tabKos, kosToggle, mapBtn, dragging
 local panels = {}
 local active = nil
 
-local function Say(msg, visible)
+local function Say(msg)
 	if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
-		if visible then commandDepth = commandDepth + 1 end
 		pcall(DEFAULT_CHAT_FRAME.AddMessage, DEFAULT_CHAT_FRAME, "|cffca9455Olympus|r: " .. tostring(msg))
-		if visible then commandDepth = commandDepth - 1 end
 	end
 end
 
@@ -205,7 +178,9 @@ local function SetKosEnabled(on)
 	if tabKos then tabKos:SetShown(on) end
 	if not on and active == "kos" then OlympusMytikas_Show("recruit") end
 	if type(KillOnSight_SetEnabled) == "function" then pcall(KillOnSight_SetEnabled, on) end
-	Say("Kill on Sight is now " .. (on and "ON" or "OFF") .. ".", true)
+	commandDepth = commandDepth + 1
+	Say("Kill on Sight is now " .. (on and "ON" or "OFF") .. ".")
+	commandDepth = commandDepth - 1
 	return on
 end
 
@@ -213,18 +188,6 @@ OlympusMytikas_KoS = { enabled = KosEnabled, set = SetKosEnabled }
 
 -- The game's own portrait frame, like the kill board uses, so the merged window
 -- reads as part of Forever. Fallbacks keep it working on any interface version.
-local function MyVersion()
-	local v
-	if type(C_AddOns) == "table" and type(C_AddOns.GetAddOnMetadata) == "function" then
-		v = C_AddOns.GetAddOnMetadata(ADDON, "Version")
-	end
-	if (type(v) ~= "string" or v == "") and type(GetAddOnMetadata) == "function" then
-		v = GetAddOnMetadata(ADDON, "Version")
-	end
-	if type(v) ~= "string" or v == "" then v = "1.1.2" end
-	return v
-end
-
 local function BuildShell()
 	if shell then return shell end
 	local f
@@ -280,23 +243,23 @@ local function BuildShell()
 	bar:SetSize(CONTENT_W, 28)
 	bar:SetPoint("TOPLEFT", f, "TOPLEFT", 10, -44)
 
-	local function MakeTab(label, x, width, key)
+	local function MakeTab(label, x, key)
 		local b = CreateFrame("Button", nil, bar, "UIPanelButtonTemplate")
-		b:SetSize(width, 24)
+		b:SetSize(140, 24)
 		b:SetPoint("TOPLEFT", bar, "TOPLEFT", x, 0)
 		b:SetText(label)
 		b:SetScript("OnClick", function() OlympusMytikas_Show(key) end)
 		return b
 	end
-	tabRecruit = MakeTab("Recruit", 0, 74, "recruit")
-	tabKos = MakeTab("Kill on Sight", 78, 96, "kos")
+	tabRecruit = MakeTab("Recruit", 0, "recruit")
+	tabKos = MakeTab("Kill on Sight", 150, "kos")
 	tabKos:SetShown(KosEnabled())
 
 	-- Right of the two tabs: a plain on/off switch for the KoS half. Recruit is
 	-- always available; this only stops the kill board, its chat and its syncing.
 	kosToggle = CreateFrame("Button", "OlympusMytikasKosToggle", bar, "UIPanelButtonTemplate")
-	kosToggle:SetSize(78, 24)
-	kosToggle:SetPoint("TOPLEFT", bar, "TOPLEFT", 178, 0)
+	kosToggle:SetSize(120, 24)
+	kosToggle:SetPoint("TOPLEFT", bar, "TOPLEFT", 300, 0)
 	kosToggle:SetText(KosEnabled() and "KoS ON" or "KoS OFF")
 	kosToggle:SetScript("OnClick", function() SetKosEnabled(not KosEnabled()) end)
 	kosToggle:SetScript("OnEnter", function(self)
@@ -312,20 +275,6 @@ local function BuildShell()
 	kosToggle:SetScript("OnLeave", function()
 		if type(GameTooltip) == "table" then pcall(function() GameTooltip:Hide() end) end
 	end)
-
-	local version = bar:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-	version:SetPoint("LEFT", kosToggle, "RIGHT", 8, 0)
-	version:SetText("v" .. MyVersion())
-	local url = CreateFrame("EditBox", nil, bar, "InputBoxTemplate")
-	url:SetPoint("LEFT", version, "RIGHT", 10, 0)
-	url:SetPoint("RIGHT", bar, "RIGHT", -4, 0)
-	url:SetHeight(22)
-	url:SetAutoFocus(false)
-	local memberHome = "https://app.mytikas.monster/account.html"
-	url:SetText(memberHome)
-	url:SetScript("OnEditFocusGained", function(self) self:HighlightText() end)
-	url:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
-	url:SetScript("OnEditFocusLost", function(self) self:SetText(memberHome) end)
 
 	content = CreateFrame("Frame", nil, f)
 	content:SetSize(CONTENT_W, CONTENT_H)
@@ -634,11 +583,24 @@ local function VerNow()
 	return 0
 end
 
+local function MyVersion()
+	local v
+	if type(C_AddOns) == "table" and type(C_AddOns.GetAddOnMetadata) == "function" then
+		v = C_AddOns.GetAddOnMetadata(ADDON, "Version")
+	elseif type(GetAddOnMetadata) == "function" then
+		v = GetAddOnMetadata(ADDON, "Version")
+	end
+	if type(v) ~= "string" or v == "" then v = "1.1.3" end
+	return v
+end
+
 local function ParseVersion(v)
 	if type(v) ~= "string" then return nil end
-	if #v > 26 then return nil end
-	local major, minor, patch = v:match("^(%d+)%.(%d+)%.(%d+)$")
-	if major then return { tonumber(major), tonumber(minor), tonumber(patch) } end
+	local nums = v:match("^%s*(%d[%d%.]*)")
+	if not nums then return nil end
+	local t = {}
+	for n in nums:gmatch("%d+") do t[#t + 1] = tonumber(n) end
+	return #t > 0 and t or nil
 end
 
 local function NewerVersion(a, b)
@@ -652,7 +614,7 @@ end
 local myVersion = MyVersion()
 local myNums = ParseVersion(myVersion) or { 0 }
 local verLoginAt, verLastSeen
-local verTold, verAnsweredAt, verLastAnswer = {}, {}, {}
+local verTold, verReports, verAnsweredBy, verLastAnswer = {}, {}, {}, {}
 
 local function VersionEnabled()
 	return OlympusMytikasDB.versionNotice ~= false
@@ -662,7 +624,7 @@ local function AnnounceVersion(v)
 	if verTold[v] then return end
 	verTold[v] = true
 	Say("|cffffd100A newer Olympus Mytikas version is available: " .. tostring(v)
-		.. " (you have " .. myVersion .. ").|r", true)
+		.. " (you have " .. myVersion .. ").|r")
 end
 
 local function ConfirmVersion(v)
@@ -700,7 +662,7 @@ local function AnswerVersion(dist)
 	if verLastAnswer[dist] and t - verLastAnswer[dist] < 60 then return end
 	verLastAnswer[dist] = t
 	local function go()
-		if verAnsweredAt[dist] and VerNow() - verAnsweredAt[dist] < 30 then return end
+		if verAnsweredBy[myVersion] and VerNow() - verAnsweredBy[myVersion] < 30 then return end
 		SendVersion("V\t" .. myVersion, dist)
 	end
 	if type(C_Timer) == "table" and type(C_Timer.After) == "function" then
@@ -710,20 +672,29 @@ local function AnswerVersion(dist)
 	end
 end
 
-local function OnVersionMessage(prefix, msg, dist)
-	if IsSecret(prefix) or IsSecret(msg) or IsSecret(dist) then return end
-	if prefix ~= VER_PREFIX or type(msg) ~= "string" then return end
+local function OnVersionReport(v, sender, dist)
 	if dist ~= "GUILD" and dist ~= "PARTY" and dist ~= "RAID" then return end
-	local kind, v = msg:match("^([QV])\t(.+)$")
-	local reported = ParseVersion(v)
-	if not reported then return end
-	if kind == "V" and v == myVersion then verAnsweredAt[dist] = VerNow() end
-	if NewerVersion(reported, myNums) then
-		local previous = ParseVersion(verLastSeen)
-		if not previous or NewerVersion(reported, previous) then verLastSeen = v end
-		if not verTold[v] then ConfirmVersion(v) end
-	elseif kind == "Q" and NewerVersion(myNums, reported) then
-		AnswerVersion(dist)
+	local t = ParseVersion(v)
+	if not (t and NewerVersion(t, myNums)) then return end
+	verLastSeen = v
+	if verTold[v] then return end
+	local seen = verReports[v] or {}
+	verReports[v] = seen
+	seen[tostring(sender or "?")] = true
+	-- One guild/group member with a newer build is enough. We never listen to
+	-- whispers or random channels here, so a stranger cannot make the note fire.
+	ConfirmVersion(v)
+end
+
+local function OnVersionMessage(prefix, msg, dist, sender)
+	if prefix ~= VER_PREFIX or type(msg) ~= "string" then return end
+	local kind, v = msg:match("^(%a)\t(.+)$")
+	if not kind or (kind ~= "Q" and kind ~= "V") then return end
+	if kind == "V" then verAnsweredBy[v] = VerNow() end
+	OnVersionReport(v, sender, dist)
+	if kind == "Q" then
+		local t = ParseVersion(v)
+		if t and NewerVersion(myNums, t) then AnswerVersion(dist) end
 	end
 end
 
